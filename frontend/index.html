@@ -18,6 +18,7 @@
       <div class="row">
         <input type="text" id="folder-path" placeholder="Paste a folder path, e.g. D:\Videos\Project" />
         <button id="analyze-btn" class="btn btn-primary">Analyze</button>
+        <button id="reset-btn" class="btn btn-secondary">Reset</button>
       </div>
       <p id="folder-status" class="status" hidden></p>
     </section>
@@ -100,6 +101,7 @@
       <button id="preview-btn" class="btn btn-secondary" disabled>Preview</button>
 
       <div id="preview-panel" class="preview-panel" hidden>
+        <p class="summary-line" id="preview-selection-summary"></p>
         <table class="phase-table">
           <thead>
             <tr><th>Phase</th><th>Est. time</th><th>Est. cost</th></tr>

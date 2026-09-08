@@ -248,6 +248,7 @@ function renderScanTable() {
 // ---------- Folder step ----------
 
 const analyzeBtn = document.getElementById("analyze-btn");
+const resetBtn = document.getElementById("reset-btn");
 const folderPathInput = document.getElementById("folder-path");
 const folderStatus = document.getElementById("folder-status");
 const selectionStep = document.getElementById("selection-step");
@@ -275,6 +276,31 @@ analyzeBtn.addEventListener("click", () => {
     loadPreferences();
     renderOptionsVisibility();
   }, 300);
+});
+
+resetBtn.addEventListener("click", () => {
+  folderPathInput.value = "";
+  folderStatus.hidden = true;
+
+  state.scanData = null;
+  state.scope = "current";
+  state.expanded = { current: { video: false, audio: false }, all: { video: false, audio: false } };
+  state.selected = {
+    current: { video: new Set(), audio: new Set() },
+    all: { video: new Set(), audio: new Set() },
+  };
+  state.run.cancelling = false;
+
+  scanTableBody.innerHTML = "";
+  selectionSummary.textContent = "Selected: 0 files";
+  selectionStep.hidden = true;
+  optionsStep.hidden = true;
+  actionStep.hidden = true;
+
+  previewTableBody.innerHTML = "";
+  previewSelectionSummary.textContent = "";
+  invalidatePreview();
+  resetRunAndDiagnostics();
 });
 
 // ---------- Options step ----------
@@ -342,6 +368,9 @@ function updatePreviewEnabled() {
     modalOk = !!gpuSelect.value && tokenIdInput.value.trim() && tokenSecretInput.value.trim();
   }
   previewBtn.disabled = !(hasSelection && hasFormat && modalOk);
+  // Any change to selection/options invalidates a preview already shown --
+  // Begin only ever appears right after a fresh Preview run.
+  invalidatePreview();
 }
 
 [formatChecks, tokenIdInput, tokenSecretInput, gpuSelect, modelSelect].forEach((el) => {
@@ -355,7 +384,7 @@ executionRadios.forEach((r) =>
     savePreferences();
   })
 );
-cleanupCheck.addEventListener("change", savePreferences);
+cleanupCheck.addEventListener("change", () => { updatePreviewEnabled(); savePreferences(); });
 
 // ---------- Preferences (localStorage placeholder for Phase 1; Phase 2
 // swaps this for GET/POST /api/preferences against user_prefs.json —
@@ -405,6 +434,24 @@ const logBox = document.getElementById("log-box");
 const diagnosticsStep = document.getElementById("diagnostics-step");
 const diagnosticsSummary = document.getElementById("diagnostics-summary");
 const diagnosticsTableBody = document.getElementById("diagnostics-table-body");
+const previewSelectionSummary = document.getElementById("preview-selection-summary");
+
+function invalidatePreview() {
+  // Begin only ever appears right after a fresh Preview -- any change to
+  // selection/options hides both the estimate panel and Begin again.
+  previewPanel.hidden = true;
+  beginRow.hidden = true;
+}
+
+function resetRunAndDiagnostics() {
+  runStep.hidden = true;
+  diagnosticsStep.hidden = true;
+  logBox.innerHTML = "";
+  progressBar.value = 0;
+  diagnosticsTableBody.innerHTML = "";
+  cancelBtn.disabled = false;
+  cancelBtn.textContent = "Cancel";
+}
 
 // Modal.com phases are per-file since each transcription call is an
 // ephemeral instance (see transcription/modal_app.py in the plan) --
@@ -490,7 +537,19 @@ function stepLogLabel(step, model, mode) {
 
 previewBtn.addEventListener("click", () => {
   // Phase 3/4 replace this with: await fetch('/api/preview', {...})
+  // Re-running Preview means any earlier run's log/diagnostics are stale.
+  resetRunAndDiagnostics();
+
   const estimate = computeEstimate();
+
+  const size = estimate.files.reduce((s, f) => s + f.size_bytes, 0);
+  const duration = estimate.files.reduce((s, f) => s + f.duration_sec, 0);
+  const formats = [...formatChecks.querySelectorAll("input[type=checkbox]:checked")].map((c) => c.value).join(", ");
+  const mode = currentExecutionMode();
+  const modeLabel = mode === "modal" ? `Modal.com (${gpuSelect.value})` : "Local";
+  previewSelectionSummary.textContent =
+    `${estimate.files.length} files — ${formatBytes(size)}, ${formatDuration(duration)} · ${modelSelect.value} model · ${formats} · ${modeLabel}`;
+
   previewTableBody.innerHTML = "";
   let totalSec = 0, totalCost = 0;
   for (const p of estimate.phases) {

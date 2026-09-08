@@ -308,6 +308,10 @@ body {
   margin-top: 14px;
 }
 
+.preview-panel .summary-line {
+  margin: 0 0 10px;
+}
+
 .begin-row {
   display: flex;
   justify-content: center;
