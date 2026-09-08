@@ -1,8 +1,11 @@
-// Phase 2+: scan and preferences are wired to the real FastAPI backend
-// (/api/scan, /api/preferences). Phase 3/4 still replace the Preview/Begin
-// estimate + run logic with real /api/preview, /api/transcribe,
-// /api/jobs/{id}/stream calls.
+// Scan, preferences, preview estimates, and the transcription run itself
+// are all wired to the real FastAPI backend (/api/scan, /api/preferences,
+// /api/preview, /api/transcribe, /api/jobs/{id}/stream + /cancel). This
+// file only owns rendering/DOM state -- backend/estimator.py and
+// backend/config.py are the source of truth for GPU rates and RTF tables.
 
+// GPU dropdown labels/rates still live here (backend/config.py is the
+// source of truth; kept in sync manually -- small, static, rarely changes).
 const GPU_OPTIONS = [
   { id: "T4", label: "T4", rate: 0.59 },
   { id: "L4", label: "L4", rate: 0.8 },
@@ -11,16 +14,6 @@ const GPU_OPTIONS = [
   { id: "H100", label: "H100", rate: 3.95 },
 ];
 const RECOMMENDED_GPU = "L4";
-
-// Approximate real-time-factor (processing seconds per second of audio),
-// calibrated for beam_size=5. Backend estimator.py (Phase 3/4) is the
-// source of truth; these are placeholders for the Preview panel demo.
-const RTF_LOCAL_CPU = {
-  tiny: 0.1, base: 0.15, small: 0.25, medium: 0.45, "large-v3": 0.7, "large-v3-turbo": 0.35,
-};
-const RTF_MODAL_GPU = {
-  tiny: 0.015, base: 0.02, small: 0.03, medium: 0.05, "large-v3": 0.08, "large-v3-turbo": 0.045,
-};
 
 // ---------- Formatting helpers ----------
 
@@ -57,7 +50,6 @@ const state = {
     current: { video: new Set(), audio: new Set() },
     all: { video: new Set(), audio: new Set() },
   },
-  run: { cancelling: false, timer: null },
 };
 
 function scopeStats(scopeKey, type) {
@@ -254,7 +246,15 @@ resetBtn.addEventListener("click", () => {
     current: { video: new Set(), audio: new Set() },
     all: { video: new Set(), audio: new Set() },
   };
-  state.run.cancelling = false;
+
+  if (activeEventSource) {
+    activeEventSource.close();
+    activeEventSource = null;
+  }
+  if (activeJobId) {
+    fetch(`/api/jobs/${activeJobId}/cancel`, { method: "POST" }).catch(() => {});
+    activeJobId = null;
+  }
 
   scanTableBody.innerHTML = "";
   selectionSummary.textContent = "Selected: 0 files";
@@ -442,118 +442,69 @@ function resetRunAndDiagnostics() {
   cancelBtn.textContent = "Cancel";
 }
 
-// Modal.com phases are per-file since each transcription call is an
-// ephemeral instance (see transcription/modal_app.py in the plan) --
-// setup/model-install happens fresh per file, same for the download back.
-// These are placeholder constants for the Preview demo; Phase 3/4 replace
-// them with backend estimator.py's real figures.
-const MODAL_SETUP_SEC = 20; // cold start: spin instance + install/load model
-const MODAL_DOWNLOAD_SEC = 2; // transcript result back to local
+let activeJobId = null;
+let activeEventSource = null;
 
-function computeEstimate() {
-  const files = selectedFilesInActiveScope();
-  const model = modelSelect.value;
+function buildTranscribeRequest() {
+  const files = selectedFilesInActiveScope().map((f) => ({
+    path: f.path, type: f.type, duration_sec: f.duration_sec,
+  }));
   const mode = currentExecutionMode();
-  const rtfTable = mode === "modal" ? RTF_MODAL_GPU : RTF_LOCAL_CPU;
-  const rtf = rtfTable[model];
-  const gpu = mode === "modal" ? GPU_OPTIONS.find((g) => g.id === gpuSelect.value) : null;
-  const doCleanup = cleanupCheck.checked;
-
-  const PHASE_ORDER = mode === "modal"
-    ? ["Audio Extraction", "Modal.com Setup & Model Install", "Transcription", "Download Transcript to Local", "Cleanup"]
-    : ["Audio Extraction", "Transcription", "Cleanup"];
-
-  // Flat, file-major ordered list -- mirrors the real per-file pipeline
-  // (extract -> [modal setup] -> transcribe -> [download] -> cleanup) so
-  // it can drive both the Preview totals and the weighted progress bar.
-  const steps = [];
-  for (const f of files) {
-    if (f.type === "video") {
-      steps.push({ file: f, name: "Audio Extraction", sec: (f.duration_sec / 60) * 2, cost: 0 }); // ~2s/min source
-    }
-    if (mode === "modal") {
-      steps.push({ file: f, name: "Modal.com Setup & Model Install", sec: MODAL_SETUP_SEC, cost: (MODAL_SETUP_SEC / 3600) * gpu.rate });
-    }
-    const transcriptionSec = f.duration_sec * rtf;
-    steps.push({
-      file: f,
-      name: "Transcription",
-      sec: transcriptionSec,
-      cost: mode === "modal" ? (transcriptionSec / 3600) * gpu.rate : 0,
-    });
-    if (mode === "modal") {
-      steps.push({ file: f, name: "Download Transcript to Local", sec: MODAL_DOWNLOAD_SEC, cost: 0 });
-    }
-    if (doCleanup && f.type === "video") {
-      steps.push({ file: f, name: "Cleanup", sec: 1, cost: 0 });
-    }
-  }
-
-  const totalsByName = {};
-  for (const name of PHASE_ORDER) totalsByName[name] = { sec: 0, cost: 0 };
-  for (const s of steps) { totalsByName[s.name].sec += s.sec; totalsByName[s.name].cost += s.cost; }
-
-  const phases = PHASE_ORDER
-    .filter((name) => name !== "Cleanup" || doCleanup)
-    .map((name) => ({ name, sec: totalsByName[name].sec, cost: totalsByName[name].cost }));
-
-  return { phases, steps, files };
+  return {
+    folder_path: state.scanData.folder,
+    files,
+    model: modelSelect.value,
+    formats: [...formatChecks.querySelectorAll("input[type=checkbox]:checked")].map((c) => c.value),
+    execution: mode,
+    gpu: mode === "modal" ? gpuSelect.value : null,
+    cleanup: cleanupCheck.checked,
+    // Phase 4 adds modal_token_id/modal_token_secret here -- held only in
+    // memory for this one request, never persisted (see updatePreviewEnabled).
+  };
 }
 
-function groupStepsByFile(steps) {
-  const groups = [];
-  let current = null;
-  for (const s of steps) {
-    if (!current || current.file !== s.file) {
-      current = { file: s.file, steps: [] };
-      groups.push(current);
-    }
-    current.steps.push(s);
-  }
-  return groups;
-}
-
-function stepLogLabel(step, model, mode) {
-  switch (step.name) {
-    case "Audio Extraction": return `Extracting audio: ${step.file.path}`;
-    case "Modal.com Setup & Model Install": return `Setting up Modal.com & installing ${model} model: ${step.file.path}`;
-    case "Transcription": return `Transcribing (${mode}, ${model}): ${step.file.path}`;
-    case "Download Transcript to Local": return `Downloading transcript: ${step.file.path}`;
-    case "Cleanup": return `Cleaning up intermediate audio: ${step.file.path}`;
-    default: return `${step.name}: ${step.file.path}`;
-  }
-}
-
-previewBtn.addEventListener("click", () => {
-  // Phase 3/4 replace this with: await fetch('/api/preview', {...})
+previewBtn.addEventListener("click", async () => {
   // Re-running Preview means any earlier run's log/diagnostics are stale.
   resetRunAndDiagnostics();
 
-  const estimate = computeEstimate();
-
-  const size = estimate.files.reduce((s, f) => s + f.size_bytes, 0);
-  const duration = estimate.files.reduce((s, f) => s + f.duration_sec, 0);
-  const formats = [...formatChecks.querySelectorAll("input[type=checkbox]:checked")].map((c) => c.value).join(", ");
-  const mode = currentExecutionMode();
-  const modeLabel = mode === "modal" ? `Modal.com (${gpuSelect.value})` : "Local";
+  const req = buildTranscribeRequest();
+  const selected = selectedFilesInActiveScope();
+  const size = selected.reduce((s, f) => s + f.size_bytes, 0);
+  const duration = selected.reduce((s, f) => s + f.duration_sec, 0);
+  const modeLabel = req.execution === "modal" ? `Modal.com (${req.gpu})` : "Local";
   previewSelectionSummary.textContent =
-    `${estimate.files.length} files — ${formatBytes(size)}, ${formatDuration(duration)} · ${modelSelect.value} model · ${formats} · ${modeLabel}`;
+    `${req.files.length} files — ${formatBytes(size)}, ${formatDuration(duration)} · ${req.model} model · ${req.formats.join(", ")} · ${modeLabel}`;
 
-  previewTableBody.innerHTML = "";
-  let totalSec = 0, totalCost = 0;
-  for (const p of estimate.phases) {
-    totalSec += p.sec;
-    totalCost += p.cost;
-    const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${p.name}</td><td>${formatDuration(p.sec)}</td><td>${formatCost(p.cost)}</td>`;
-    previewTableBody.appendChild(tr);
+  previewBtn.disabled = true;
+  try {
+    const res = await fetch("/api/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `Preview failed (HTTP ${res.status})`);
+    }
+    const { phases, total } = await res.json();
+
+    previewTableBody.innerHTML = "";
+    for (const p of phases) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${p.name}</td><td>${formatDuration(p.sec)}</td><td>${formatCost(p.cost)}</td>`;
+      previewTableBody.appendChild(tr);
+    }
+    const totalRow = document.createElement("tr");
+    totalRow.innerHTML = `<td><strong>Total</strong></td><td><strong>${formatDuration(total.sec)}</strong></td><td><strong>${formatCost(total.cost)}</strong></td>`;
+    previewTableBody.appendChild(totalRow);
+
+    previewPanel.hidden = false;
+    beginRow.hidden = false;
+  } catch (err) {
+    previewSelectionSummary.textContent = err.message || "Could not compute a preview.";
+  } finally {
+    previewBtn.disabled = false;
   }
-  const totalRow = document.createElement("tr");
-  totalRow.innerHTML = `<td><strong>Total</strong></td><td><strong>${formatDuration(totalSec)}</strong></td><td><strong>${formatCost(totalCost)}</strong></td>`;
-  previewTableBody.appendChild(totalRow);
-
-  previewPanel.hidden = false;
-  beginRow.hidden = false;
 });
 
 function addLogLine(text, isFail) {
@@ -564,100 +515,82 @@ function addLogLine(text, isFail) {
   logBox.scrollTop = logBox.scrollHeight;
 }
 
-beginBtn.addEventListener("click", () => {
-  // Phase 3/4 replace this simulated run with real /api/transcribe +
-  // /api/jobs/{id}/stream (SSE) + /api/jobs/{id}/cancel. The progress bar
-  // is weighted by each step's estimated seconds (same figures as the
-  // Preview table), not just a raw file count.
-  const estimate = computeEstimate();
-  const groups = groupStepsByFile(estimate.steps);
-  const totalSec = estimate.steps.reduce((s, st) => s + st.sec, 0) || 1;
-
+beginBtn.addEventListener("click", async () => {
   runStep.hidden = false;
   diagnosticsStep.hidden = true;
   logBox.innerHTML = "";
   progressBar.value = 0;
-  state.run.cancelling = false;
   cancelBtn.disabled = false;
   cancelBtn.textContent = "Cancel";
+  beginBtn.disabled = true;
 
-  const model = modelSelect.value;
-  const mode = currentExecutionMode();
-  let elapsedSec = 0;
-  let gi = 0, si = 0;
-  let succeeded = 0, failed = 0;
-
-  function processNext() {
-    if (state.run.cancelling) {
-      addLogLine("Cancelled — remaining files were not started.");
-      finishRun(true);
-      return;
+  try {
+    const res = await fetch("/api/transcribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildTranscribeRequest()),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `Could not start the job (HTTP ${res.status})`);
     }
-    if (gi >= groups.length) {
-      finishRun(false);
-      return;
-    }
-    const group = groups[gi];
-    if (si >= group.steps.length) {
-      addLogLine(`Done: ${group.file.path}`);
-      succeeded++;
-      gi++; si = 0;
-      processNext();
-      return;
-    }
-    const step = group.steps[si];
-    addLogLine(stepLogLabel(step, model, mode));
+    const { job_id } = await res.json();
+    activeJobId = job_id;
 
-    const isLastFile = gi === groups.length - 1;
-    const willFail = step.name === "Transcription" && isLastFile && groups.length > 2; // demo-only
-
-    setTimeout(() => {
-      elapsedSec += step.sec;
-      progressBar.value = Math.min(100, Math.round((elapsedSec / totalSec) * 100));
-      if (willFail) {
-        addLogLine(`Failed: ${group.file.path} — ffmpeg could not read this file`, true);
-        failed++;
-        gi++; si = 0; // skip this file's remaining steps
-      } else {
-        si++;
+    const es = new EventSource(`/api/jobs/${job_id}/stream`);
+    activeEventSource = es;
+    es.onmessage = (msg) => {
+      const event = JSON.parse(msg.data);
+      if (event.event === "log") {
+        addLogLine(event.text, !!event.fail);
+      } else if (event.event === "progress") {
+        progressBar.value = event.percent;
+      } else if (event.event === "done") {
+        es.close();
+        activeEventSource = null;
+        activeJobId = null;
+        cancelBtn.textContent = "Cancel";
+        cancelBtn.disabled = true;
+        beginBtn.disabled = false;
+        showDiagnostics(event);
       }
-      processNext();
-    }, 120);
-  }
-
-  function finishRun(wasCancelled) {
-    // Job is over (finished or successfully cancelled) -- label reverts to
-    // "Cancel" (not left reading "Cancelling…") and stays disabled since
-    // there's nothing left to cancel.
-    cancelBtn.textContent = "Cancel";
+    };
+    es.onerror = () => {
+      es.close();
+      activeEventSource = null;
+      activeJobId = null;
+      cancelBtn.disabled = true;
+      beginBtn.disabled = false;
+      addLogLine("Lost connection to the server.", true);
+    };
+  } catch (err) {
+    addLogLine(err.message || "Could not start the job.", true);
     cancelBtn.disabled = true;
-    showDiagnostics(estimate, succeeded, failed, groups.length - succeeded - failed, wasCancelled);
+    beginBtn.disabled = false;
   }
-
-  processNext();
 });
 
-cancelBtn.addEventListener("click", () => {
-  state.run.cancelling = true;
+cancelBtn.addEventListener("click", async () => {
+  if (!activeJobId) return;
   cancelBtn.disabled = true;
   cancelBtn.textContent = "Cancelling…";
   addLogLine("Cancelling… the current file is finishing first.");
+  try {
+    await fetch(`/api/jobs/${activeJobId}/cancel`, { method: "POST" });
+  } catch (e) { /* the stream's onerror handler covers a dropped connection */ }
+  // Button stays disabled/"Cancelling…" until the "done" SSE event lands
+  // (finishRun-equivalent above resets text to "Cancel" once it actually stops).
 });
 
-function showDiagnostics(estimate, succeeded, failed, skipped, wasCancelled) {
+function showDiagnostics(result) {
   diagnosticsStep.hidden = false;
-  const total = succeeded + failed + skipped;
-  diagnosticsSummary.textContent = wasCancelled
-    ? `Cancelled — ${succeeded + failed} of ${total} files processed (${succeeded} succeeded, ${failed} failed)`
-    : `${total} files processed — ${succeeded} succeeded, ${failed} failed`;
-
-  const totalSec = estimate.phases.reduce((s, p) => s + p.sec, 0);
-  const totalCost = estimate.phases.reduce((s, p) => s + p.cost, 0);
-  const processed = succeeded + failed || 1;
-  const totalMinutes = estimate.files.reduce((s, f) => s + f.duration_sec, 0) / 60 || 1;
+  const total = result.succeeded + result.failed + result.skipped;
+  diagnosticsSummary.textContent = result.cancelled
+    ? `Cancelled — ${result.succeeded + result.failed} of ${total} files processed (${result.succeeded} succeeded, ${result.failed} failed)`
+    : `${total} files processed — ${result.succeeded} succeeded, ${result.failed} failed`;
 
   diagnosticsTableBody.innerHTML = `
-    <tr><td>Processing time</td><td>${formatDuration(totalSec)}</td><td>${formatDuration(totalSec / processed)}</td><td>${formatDuration(totalSec / totalMinutes)}</td></tr>
-    <tr><td>Cost</td><td>${formatCost(totalCost)}</td><td>${formatCost(totalCost / processed)}</td><td>${formatCost(totalCost / totalMinutes)}</td></tr>
+    <tr><td>Processing time</td><td>${formatDuration(result.total_sec)}</td><td>${formatDuration(result.per_file_sec)}</td><td>${formatDuration(result.per_minute_sec)}</td></tr>
+    <tr><td>Cost</td><td>${formatCost(result.total_cost)}</td><td>${formatCost(result.per_file_cost)}</td><td>${formatCost(result.per_minute_cost)}</td></tr>
   `;
 }

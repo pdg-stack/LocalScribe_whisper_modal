@@ -15,3 +15,25 @@ class PreferencesModel(BaseModel):
     execution: str | None = None
     gpu: str | None = None
     cleanup: bool | None = None
+
+
+class FileRef(BaseModel):
+    path: str
+    type: str  # "video" | "audio"
+    duration_sec: float
+
+
+class TranscribeRequest(BaseModel):
+    folder_path: str
+    files: list[FileRef]
+    model: str
+    formats: list[str]
+    execution: str  # "local" | "modal"
+    gpu: str | None = None
+    cleanup: bool = False
+    modal_token_id: str | None = None
+    modal_token_secret: str | None = None
+
+
+class PreviewRequest(TranscribeRequest):
+    pass
