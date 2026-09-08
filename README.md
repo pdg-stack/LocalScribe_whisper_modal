@@ -1,5 +1,7 @@
 # LocalScribe_whisper_modal
 
+![LocalScribe — point it at a folder of videos, get back GPU-transcribed subtitles](docs/social-preview.png)
+
 A locally-hosted web app that scans a folder for audio/video files and
 transcribes the ones you pick, using [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
 either on your own machine (CPU) or on [Modal.com](https://modal.com) GPUs.
