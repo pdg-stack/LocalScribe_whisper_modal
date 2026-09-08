@@ -73,18 +73,29 @@
         </div>
       </div>
 
-      <div class="field-row modal-fields" id="modal-fields" hidden>
-        <label for="gpu-select">GPU type</label>
+      <div class="field-row exec-detail" id="local-fields">
+        <label>Local resources detected</label>
+        <p class="hint" id="local-resource-info"></p>
+      </div>
+
+      <div class="field-row exec-detail" id="modal-fields" hidden>
+        <label for="gpu-select">
+          <a href="https://modal.com/pricing" target="_blank" rel="noopener noreferrer">GPU type</a>
+        </label>
         <div class="gpu-row">
           <select id="gpu-select"></select>
           <span class="hint" id="gpu-recommendation"></span>
         </div>
-        <label for="modal-token-id">Modal Token ID</label>
+        <label for="modal-token-id">
+          <a href="https://modal.com/settings/tokens" target="_blank" rel="noopener noreferrer">Modal Token ID</a>
+        </label>
         <div class="password-field">
           <input type="password" id="modal-token-id" autocomplete="off" />
           <button type="button" class="eye-toggle" data-target="modal-token-id" aria-label="Show Modal Token ID"></button>
         </div>
-        <label for="modal-token-secret">Modal Token Secret</label>
+        <label for="modal-token-secret">
+          <a href="https://modal.com/settings/tokens" target="_blank" rel="noopener noreferrer">Modal Token Secret</a>
+        </label>
         <div class="password-field">
           <input type="password" id="modal-token-secret" autocomplete="off" />
           <button type="button" class="eye-toggle" data-target="modal-token-secret" aria-label="Show Modal Token Secret"></button>

@@ -208,6 +208,15 @@ body {
   font-weight: 500;
 }
 
+.field-row label a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.field-row label a:hover {
+  text-decoration: underline;
+}
+
 .field-row select,
 .field-row input[type="password"],
 .field-row input[type="text"] {
@@ -280,7 +289,7 @@ body {
   font-size: 12px;
 }
 
-.modal-fields {
+.exec-detail {
   border-top: 1px dashed var(--border);
   padding-top: 12px;
 }
@@ -315,6 +324,14 @@ body {
 .begin-row {
   display: flex;
   justify-content: center;
+}
+
+/* `.begin-row`'s own `display: flex` has the same specificity as the
+   browser default `[hidden] { display: none }` and would otherwise win
+   the tie (author styles are later in the cascade) -- this explicit
+   override is what actually keeps Begin hidden until Preview runs. */
+.begin-row[hidden] {
+  display: none;
 }
 
 /* Run step */

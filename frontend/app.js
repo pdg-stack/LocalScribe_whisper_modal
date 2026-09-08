@@ -307,6 +307,8 @@ resetBtn.addEventListener("click", () => {
 
 const formatChecks = document.getElementById("format-checks");
 const executionRadios = document.getElementsByName("execution");
+const localFields = document.getElementById("local-fields");
+const localResourceInfo = document.getElementById("local-resource-info");
 const modalFields = document.getElementById("modal-fields");
 const gpuSelect = document.getElementById("gpu-select");
 const gpuRecommendation = document.getElementById("gpu-recommendation");
@@ -324,6 +326,18 @@ GPU_OPTIONS.forEach((gpu) => {
   gpuSelect.appendChild(opt);
 });
 gpuRecommendation.textContent = `Recommended: ${RECOMMENDED_GPU} — best cost/throughput balance for Whisper inference`;
+
+// Placeholder hardware summary for the Local execution path -- Phase 2+
+// replaces this with a real backend endpoint (e.g. psutil for CPU/RAM,
+// torch.cuda.is_available()/nvidia-smi for GPU) reporting this machine's
+// actual resources.
+const MOCK_LOCAL_RESOURCES = {
+  cpu: "Intel Core i7-12700K — 12 cores / 20 threads",
+  ram: "32 GB RAM",
+  gpu: "NVIDIA GeForce RTX 3080 (10 GB VRAM) — CUDA available",
+};
+localResourceInfo.textContent =
+  `CPU: ${MOCK_LOCAL_RESOURCES.cpu} · RAM: ${MOCK_LOCAL_RESOURCES.ram} · GPU: ${MOCK_LOCAL_RESOURCES.gpu}`;
 
 // ---------- Show/hide toggle for Modal token fields (copy/paste/cut are
 // never blocked -- neither <input type=password> nor this toggle does
@@ -379,7 +393,9 @@ function updatePreviewEnabled() {
 });
 executionRadios.forEach((r) =>
   r.addEventListener("change", () => {
-    modalFields.hidden = currentExecutionMode() !== "modal";
+    const mode = currentExecutionMode();
+    localFields.hidden = mode !== "local";
+    modalFields.hidden = mode !== "modal";
     updatePreviewEnabled();
     savePreferences();
   })
@@ -415,6 +431,7 @@ function loadPreferences() {
   }
   if (prefs.execution) {
     executionRadios.forEach((r) => { r.checked = r.value === prefs.execution; });
+    localFields.hidden = prefs.execution !== "local";
     modalFields.hidden = prefs.execution !== "modal";
   }
   if (prefs.gpu) gpuSelect.value = prefs.gpu;
@@ -637,7 +654,11 @@ beginBtn.addEventListener("click", () => {
   }
 
   function finishRun(wasCancelled) {
-    cancelBtn.disabled = true; // job is over (finished or cancelled) -- nothing left to cancel
+    // Job is over (finished or successfully cancelled) -- label reverts to
+    // "Cancel" (not left reading "Cancelling…") and stays disabled since
+    // there's nothing left to cancel.
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.disabled = true;
     showDiagnostics(estimate, succeeded, failed, groups.length - succeeded - failed, wasCancelled);
   }
 
