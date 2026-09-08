@@ -84,8 +84,11 @@ To run transcription on a Modal.com GPU instead of locally:
    [modal.com/pricing](https://modal.com/pricing); **L4** is recommended
    as the best cost/throughput balance for Whisper inference), and paste
    in the Token ID/Secret.
-3. Credentials are only ever held in memory for that one request — never
-   written to disk, never included in `user_prefs.json`.
+3. Your Token ID/Secret are saved in `user_prefs.json` so you don't have
+   to re-enter them each time. **This means they're stored in plaintext
+   on your local disk.** The file is gitignored (never committed) and the
+   credentials are never sent anywhere but Modal itself, but be aware of
+   this if you share this machine or that file with anyone.
 
 No prior `modal deploy` or `modal token set` is needed for the app itself
 — it builds and runs an ephemeral Modal app per request using the

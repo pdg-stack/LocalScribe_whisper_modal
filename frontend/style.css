@@ -301,6 +301,37 @@ body {
   margin-bottom: 12px;
 }
 
+.phase-icon {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  vertical-align: middle;
+  flex: 0 0 auto;
+}
+
+.phase-icon--spinner {
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: phase-spin 0.8s linear infinite;
+}
+
+.phase-icon--done,
+.phase-icon--failed {
+  width: auto;
+  height: auto;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.phase-icon--done { color: var(--success); }
+.phase-icon--failed { color: var(--fail); }
+
+@keyframes phase-spin {
+  to { transform: rotate(360deg); }
+}
+
 .phase-table th,
 .phase-table td {
   padding: 6px 8px;

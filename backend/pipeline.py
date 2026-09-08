@@ -11,6 +11,7 @@ import logging
 import time
 from pathlib import Path
 
+from backend import calibration
 from backend.config import BEAM_SIZE, GPU_OPTIONS
 from backend.estimator import aggregate_phases, compute_steps
 from backend.ffmpeg_utils import FfmpegNotFoundError, extract_audio
@@ -40,6 +41,8 @@ def _step_label(step: dict, model: str, execution: str) -> str:
     path = step["file"]["path"]
     if name == "Audio Extraction":
         return f"Extracting audio: {path}"
+    if name == "Whisper Model Setup":
+        return f"Loading {model} model (downloading if not already cached)"
     if name == "Modal.com Setup & Model Install":
         return f"Setting up Modal.com & installing {model} model: {path}"
     if name == "Transcription":
@@ -96,23 +99,38 @@ def _run_file_group(
     for step in group["steps"]:
         label = _step_label(step, model_name, execution)
         job.emit({"event": "log", "text": label})
+        job.emit({"event": "step_start", "step": step["name"]})
         logger.info(label)
         try:
             if step["name"] == "Audio Extraction":
                 extract_audio(abs_path, wav_path)
                 audio_path = wav_path
+            elif step["name"] == "Whisper Model Setup":
+                started = time.perf_counter()
+                engine.get_model(model_name, device="cpu")  # loads (or downloads) and caches
+                calibration.record_setup_sample(model_name, "cpu", time.perf_counter() - started)
             elif step["name"] == "Transcription":
+                file_duration_sec = file_info["duration_sec"]
                 if execution == "modal":
                     started = time.perf_counter()
                     raw = modal_app.transcribe_on_modal(
                         audio_path.read_bytes(), model_name, gpu, BEAM_SIZE,
                         modal_token_id, modal_token_secret,
                     )
+                    # Cost is billed on the *full* RPC wall time (incl. cold
+                    # start); calibration uses inference_sec alone so a
+                    # short clip's cold-start overhead doesn't skew future
+                    # throughput estimates for this (model, GPU) pair.
                     real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
-                    group["_segments"] = [engine.Segment(**s) for s in raw]
+                    group["_segments"] = [engine.Segment(**s) for s in raw["segments"]]
+                    if file_duration_sec > 0:
+                        calibration.record_rtf_sample(model_name, gpu, raw["inference_sec"] / file_duration_sec)
                 else:
-                    model = engine.get_model(model_name, device="cpu")
+                    model = engine.get_model(model_name, device="cpu")  # already loaded by the Setup step; cheap
+                    started = time.perf_counter()
                     group["_segments"] = engine.transcribe(model, audio_path)
+                    if file_duration_sec > 0:
+                        calibration.record_rtf_sample(model_name, "cpu", (time.perf_counter() - started) / file_duration_sec)
                 for fmt in formats:
                     out_path = abs_path.with_suffix(f".{fmt}")
                     writers.write_format(fmt, group["_segments"], out_path)
@@ -127,6 +145,7 @@ def _run_file_group(
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user as a log line
             message = _friendly_error(exc)
             job.emit({"event": "log", "text": f"Failed: {file_info['path']} — {message}", "fail": True})
+            job.emit({"event": "step_failed", "step": step["name"]})
             logger.exception("Failed during %s on %s", step["name"], file_info["path"])
             return False, message, real_cost
 
