@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime data (private, never committed)
+logs/
+user_prefs.json
+
+# Env / secrets
+.env
+
+# Editor
+.vscode/
+.idea/

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LocalScribe</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="page">
+    <header class="app-header">
+      <h1>LocalScribe</h1>
+      <p class="subtitle">Transcribe local audio &amp; video files with Whisper — locally or on Modal.com</p>
+    </header>
+
+    <!-- Step 1: Folder -->
+    <section class="card" id="folder-step">
+      <div class="row">
+        <input type="text" id="folder-path" placeholder="Paste a folder path, e.g. D:\Videos\Project" />
+        <button id="analyze-btn" class="btn btn-primary">Analyze</button>
+      </div>
+      <p id="folder-status" class="status" hidden></p>
+    </section>
+
+    <!-- Step 2: File selection -->
+    <section class="card" id="selection-step" hidden>
+      <h2>Select the files to transcribe</h2>
+      <table class="scan-table" id="scan-table">
+        <thead>
+          <tr>
+            <th class="col-label"></th>
+            <th>Count</th>
+            <th>Size</th>
+            <th>Duration</th>
+          </tr>
+        </thead>
+        <tbody id="scan-table-body"></tbody>
+      </table>
+      <p class="summary-line" id="selection-summary">Selected: 0 files</p>
+    </section>
+
+    <!-- Step 3: Options -->
+    <section class="card" id="options-step" hidden>
+      <div class="field-row">
+        <label for="model-select">Whisper model</label>
+        <select id="model-select">
+          <option value="tiny">tiny</option>
+          <option value="base">base</option>
+          <option value="small" selected>small</option>
+          <option value="medium">medium</option>
+          <option value="large-v3">large-v3</option>
+          <option value="large-v3-turbo">large-v3-turbo</option>
+        </select>
+      </div>
+
+      <div class="field-row">
+        <label>Output formats</label>
+        <div class="inline-checks" id="format-checks">
+          <label><input type="checkbox" value="txt" checked /> txt</label>
+          <label><input type="checkbox" value="srt" checked /> srt</label>
+          <label><input type="checkbox" value="vtt" /> vtt</label>
+          <label><input type="checkbox" value="json" /> json</label>
+          <label><input type="checkbox" value="tsv" /> tsv</label>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label>Execution</label>
+        <div class="inline-checks">
+          <label><input type="radio" name="execution" value="local" checked /> Local</label>
+          <label><input type="radio" name="execution" value="modal" /> Modal.com</label>
+        </div>
+      </div>
+
+      <div class="field-row modal-fields" id="modal-fields" hidden>
+        <label for="gpu-select">GPU type</label>
+        <div class="gpu-row">
+          <select id="gpu-select"></select>
+          <span class="hint" id="gpu-recommendation"></span>
+        </div>
+        <label for="modal-token-id">Modal Token ID</label>
+        <input type="password" id="modal-token-id" autocomplete="off" />
+        <label for="modal-token-secret">Modal Token Secret</label>
+        <input type="password" id="modal-token-secret" autocomplete="off" />
+      </div>
+
+      <div class="field-row">
+        <label><input type="checkbox" id="cleanup-check" checked /> Delete intermediate audio files when done</label>
+      </div>
+    </section>
+
+    <!-- Action row -->
+    <section class="card" id="action-step" hidden>
+      <button id="preview-btn" class="btn btn-secondary" disabled>Preview</button>
+
+      <div id="preview-panel" class="preview-panel" hidden>
+        <table class="phase-table">
+          <thead>
+            <tr><th>Phase</th><th>Est. time</th><th>Est. cost</th></tr>
+          </thead>
+          <tbody id="preview-table-body"></tbody>
+        </table>
+        <button id="begin-btn" class="btn btn-primary">Begin</button>
+      </div>
+    </section>
+
+    <!-- Run step -->
+    <section class="card" id="run-step" hidden>
+      <div class="progress-row">
+        <progress id="progress-bar" max="100" value="0"></progress>
+        <button id="cancel-btn" class="btn btn-danger">Cancel</button>
+      </div>
+      <div class="log-box" id="log-box"></div>
+    </section>
+
+    <!-- Diagnostics -->
+    <section class="card" id="diagnostics-step" hidden>
+      <p id="diagnostics-summary" class="summary-line"></p>
+      <table class="phase-table">
+        <thead>
+          <tr><th></th><th>Total</th><th>Per file</th><th>Per minute of media</th></tr>
+        </thead>
+        <tbody id="diagnostics-table-body"></tbody>
+      </table>
+      <p class="hint">Full per-file logs saved under <code>logs/</code> locally.</p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

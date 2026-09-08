@@ -1,0 +1,310 @@
+:root {
+  --bg: #f7f7f8;
+  --card-bg: #ffffff;
+  --text: #1a1a1e;
+  --text-dim: #6b6b76;
+  --border: #e0e0e6;
+  --accent: #4f5dff;
+  --accent-text: #ffffff;
+  --danger: #d9453d;
+  --greyed: #b8b8c2;
+  --success: #1e8e5a;
+  --fail: #d9453d;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17171b;
+    --card-bg: #1f1f24;
+    --text: #ececf0;
+    --text-dim: #9a9aa5;
+    --border: #34343c;
+    --accent: #7b86ff;
+    --accent-text: #101018;
+    --danger: #ff6b63;
+    --greyed: #4a4a55;
+    --success: #4fce93;
+    --fail: #ff6b63;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+}
+
+.page {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 32px 20px 80px;
+}
+
+.app-header h1 {
+  margin: 0 0 4px;
+  font-size: 22px;
+}
+
+.subtitle {
+  margin: 0 0 24px;
+  color: var(--text-dim);
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 20px;
+  margin-bottom: 16px;
+}
+
+.card h2 {
+  margin: 0 0 12px;
+  font-size: 15px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+}
+
+#folder-path {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  font-size: 14px;
+  cursor: pointer;
+  background: var(--card-bg);
+  color: var(--text);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: transparent;
+}
+
+.btn-danger {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: transparent;
+}
+
+.status {
+  margin: 10px 0 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.status.error {
+  color: var(--fail);
+}
+
+/* Scan table */
+.scan-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.scan-table th {
+  text-align: right;
+  font-weight: 600;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.scan-table th.col-label {
+  text-align: left;
+}
+
+.scan-table td {
+  padding: 6px 8px;
+  text-align: right;
+  border-top: 1px solid var(--border);
+}
+
+.scan-table td.col-label {
+  text-align: left;
+}
+
+.scope-row .col-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.type-row .col-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 22px;
+}
+
+.type-row.greyed {
+  color: var(--greyed);
+  pointer-events: none;
+}
+
+.type-row.greyed input {
+  pointer-events: none;
+}
+
+.accordion-toggle {
+  cursor: pointer;
+  width: 14px;
+  display: inline-block;
+  user-select: none;
+  color: var(--text-dim);
+}
+
+.type-row.greyed .accordion-toggle {
+  cursor: default;
+}
+
+.file-row td.col-label {
+  padding-left: 46px;
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+.file-row.hidden-row {
+  display: none;
+}
+
+.summary-line {
+  margin: 12px 0 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+/* Options */
+.field-row {
+  margin-bottom: 14px;
+}
+
+.field-row label {
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 500;
+}
+
+.field-row select,
+.field-row input[type="password"] {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  width: 100%;
+  max-width: 320px;
+  margin-bottom: 6px;
+}
+
+.inline-checks {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.inline-checks label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 400;
+  margin: 0;
+}
+
+.gpu-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.hint {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.modal-fields {
+  border-top: 1px dashed var(--border);
+  padding-top: 12px;
+}
+
+/* Preview / diagnostics tables */
+.phase-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 12px;
+}
+
+.phase-table th,
+.phase-table td {
+  padding: 6px 8px;
+  text-align: right;
+  border-top: 1px solid var(--border);
+}
+
+.phase-table th:first-child,
+.phase-table td:first-child {
+  text-align: left;
+}
+
+.preview-panel {
+  margin-top: 14px;
+}
+
+/* Run step */
+.progress-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+#progress-bar {
+  flex: 1;
+  height: 10px;
+}
+
+.log-box {
+  margin-top: 12px;
+  max-height: 160px;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.log-line {
+  white-space: pre-wrap;
+  margin: 2px 0;
+}
+
+.log-line.fail { color: var(--fail); }
