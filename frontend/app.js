@@ -378,6 +378,10 @@ async function savePreferences() {
     execution: currentExecutionMode(),
     gpu: gpuSelect.value,
     cleanup: cleanupCheck.checked,
+    // Saved at the user's request so they don't have to re-enter them --
+    // stored in plaintext in user_prefs.json (gitignored, local-only).
+    modal_token_id: tokenIdInput.value.trim() || null,
+    modal_token_secret: tokenSecretInput.value.trim() || null,
   };
   try {
     await fetch("/api/preferences", {
@@ -408,6 +412,9 @@ async function loadPreferences() {
   }
   if (prefs.gpu) gpuSelect.value = prefs.gpu;
   if (typeof prefs.cleanup === "boolean") cleanupCheck.checked = prefs.cleanup;
+  if (prefs.modal_token_id) tokenIdInput.value = prefs.modal_token_id;
+  if (prefs.modal_token_secret) tokenSecretInput.value = prefs.modal_token_secret;
+  updatePreviewEnabled();
 }
 
 // ---------- Preview / Begin / Cancel ----------
@@ -444,6 +451,31 @@ function resetRunAndDiagnostics() {
 
 let activeJobId = null;
 let activeEventSource = null;
+let phaseStatus = {}; // { [phaseName]: { doneCount, expectedCount, failed } }, live-tracked during a run
+
+// Mirrors backend/estimator.py's compute_steps() phase-assignment logic
+// (which files get which phases) so the frontend knows how many
+// (file, phase) instances to expect before marking a phase row "done".
+function computeExpectedPhaseCounts(files, execution, cleanup) {
+  const counts = {};
+  const bump = (name) => { counts[name] = (counts[name] || 0) + 1; };
+  files.forEach((f, i) => {
+    if (f.type === "video") bump("Audio Extraction");
+    if (execution !== "modal" && i === 0) bump("Whisper Model Setup");
+    if (execution === "modal") bump("Modal.com Setup & Model Install");
+    bump("Transcription");
+    if (execution === "modal") bump("Download Transcript to Local");
+    if (cleanup && f.type === "video") bump("Cleanup");
+  });
+  return counts;
+}
+
+function setPhaseIcon(phaseName, state) {
+  const el = previewTableBody.querySelector(`.phase-icon[data-phase="${phaseName}"]`);
+  if (!el) return;
+  el.className = "phase-icon" + (state ? ` phase-icon--${state}` : "");
+  el.textContent = state === "done" ? "✓" : state === "failed" ? "✗" : "";
+}
 
 function buildTranscribeRequest() {
   const files = selectedFilesInActiveScope().map((f) => ({
@@ -458,8 +490,8 @@ function buildTranscribeRequest() {
     execution: mode,
     gpu: mode === "modal" ? gpuSelect.value : null,
     cleanup: cleanupCheck.checked,
-    // Held only in memory for this one request -- never written to
-    // user_prefs.json or any other file (see savePreferences()).
+    // Also saved to user_prefs.json (plaintext) by savePreferences() so
+    // the user doesn't have to re-enter them each time.
     modal_token_id: mode === "modal" ? tokenIdInput.value.trim() : null,
     modal_token_secret: mode === "modal" ? tokenSecretInput.value.trim() : null,
   };
@@ -493,7 +525,7 @@ previewBtn.addEventListener("click", async () => {
     previewTableBody.innerHTML = "";
     for (const p of phases) {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${p.name}</td><td>${formatDuration(p.sec)}</td><td>${formatCost(p.cost)}</td>`;
+      tr.innerHTML = `<td><span class="phase-icon" data-phase="${p.name}"></span>${p.name}</td><td>${formatDuration(p.sec)}</td><td>${formatCost(p.cost)}</td>`;
       previewTableBody.appendChild(tr);
     }
     const totalRow = document.createElement("tr");
@@ -526,11 +558,19 @@ beginBtn.addEventListener("click", async () => {
   cancelBtn.textContent = "Cancel";
   beginBtn.disabled = true;
 
+  const req = buildTranscribeRequest();
+  const expected = computeExpectedPhaseCounts(req.files, req.execution, req.cleanup);
+  phaseStatus = {};
+  for (const [name, expectedCount] of Object.entries(expected)) {
+    phaseStatus[name] = { doneCount: 0, expectedCount, failed: false };
+    setPhaseIcon(name, null); // clear any icon left from a previous run
+  }
+
   try {
     const res = await fetch("/api/transcribe", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildTranscribeRequest()),
+      body: JSON.stringify(req),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
@@ -545,6 +585,19 @@ beginBtn.addEventListener("click", async () => {
       const event = JSON.parse(msg.data);
       if (event.event === "log") {
         addLogLine(event.text, !!event.fail);
+      } else if (event.event === "step_start") {
+        const st = phaseStatus[event.step];
+        if (st && !st.failed) setPhaseIcon(event.step, "spinner");
+      } else if (event.event === "step_done") {
+        const st = phaseStatus[event.step];
+        if (st && !st.failed) {
+          st.doneCount++;
+          setPhaseIcon(event.step, st.doneCount >= st.expectedCount ? "done" : "spinner");
+        }
+      } else if (event.event === "step_failed") {
+        const st = phaseStatus[event.step];
+        if (st) st.failed = true;
+        setPhaseIcon(event.step, "failed");
       } else if (event.event === "progress") {
         progressBar.value = event.percent;
       } else if (event.event === "done") {

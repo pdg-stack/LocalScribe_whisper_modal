@@ -69,11 +69,13 @@ only), streaming/live audio.
   - Modal.com reveals a GPU type dropdown (T4/L4/A10G/A100/H100, each
     showing $/hr) with **L4 recommended and pre-selected by default**, and
     two credential fields — **Modal Token ID** and **Modal Token Secret**
-    (password inputs, held only in memory for the request, never
-    persisted).
+    (password inputs).
 - "Delete intermediate audio files when done" checkbox.
-- Model/formats/execution/GPU selections persist across sessions
-  (non-secret only); credentials never persist.
+- Model/formats/execution/GPU/credential selections persist across
+  sessions in `user_prefs.json`, at the user's explicit request (revised
+  from the original "credentials never persist" design) — the Token
+  ID/Secret are stored there in **plaintext**; the file stays gitignored
+  and the credentials are never transmitted anywhere but Modal itself.
 
 ### 4.4 Preview → Begin → Cancel
 - **Preview** is enabled only once all required inputs are present; it
@@ -114,8 +116,9 @@ file.
 ## 5. Non-functional requirements
 - No build step for the frontend (plain HTML/CSS/JS) — keeps the app
   simple to run (`pip install` + `uvicorn`) with nothing else to install.
-- No secrets committed to the repo or written to `user_prefs.json`; Modal
-  credentials exist only in memory for the duration of a request.
+- No secrets committed to the repo — `user_prefs.json` is gitignored.
+  Modal credentials *are* written there in plaintext (see 4.3), at the
+  user's request, for convenience; never transmitted anywhere but Modal.
 - Runs fully locally; the only outbound network call is to Modal.com when
   that execution mode is explicitly chosen.
 

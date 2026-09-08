@@ -15,6 +15,11 @@ class PreferencesModel(BaseModel):
     execution: str | None = None
     gpu: str | None = None
     cleanup: bool | None = None
+    # Persisted at the user's explicit request so they don't have to
+    # re-enter them each time -- stored in plaintext in user_prefs.json
+    # (gitignored, local-only, never transmitted anywhere but Modal).
+    modal_token_id: str | None = None
+    modal_token_secret: str | None = None
 
 
 class FileRef(BaseModel):

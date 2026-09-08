@@ -48,8 +48,8 @@ def get_preferences():
 
 @app.post("/api/preferences")
 def save_preferences(prefs: PreferencesModel):
-    # Only ever the non-secret fields below -- credentials are never
-    # accepted here and never touch disk.
+    # Includes modal_token_id/modal_token_secret at the user's request --
+    # written in plaintext to PREFS_PATH (gitignored, local-only).
     data = {k: v for k, v in prefs.model_dump().items() if v is not None}
     PREFS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return data

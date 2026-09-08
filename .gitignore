@@ -6,6 +6,7 @@ __pycache__/
 # Runtime data (private, never committed)
 logs/
 user_prefs.json
+rtf_calibration.json
 
 # Env / secrets
 .env
