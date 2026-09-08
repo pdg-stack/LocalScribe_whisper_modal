@@ -7,13 +7,15 @@ progress/log events through the job's queue as it goes.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from pathlib import Path
 
 from backend.config import BEAM_SIZE, GPU_OPTIONS
 from backend.estimator import aggregate_phases, compute_steps
-from backend.ffmpeg_utils import extract_audio
+from backend.ffmpeg_utils import FfmpegNotFoundError, extract_audio
 from backend.jobs import Job
+from backend.logging_utils import get_job_logger
 from backend.transcription import engine, modal_app, writers
 
 
@@ -50,7 +52,24 @@ def _step_label(step: dict, model: str, execution: str) -> str:
 
 
 def _friendly_error(exc: Exception) -> str:
-    return str(exc) or exc.__class__.__name__
+    text = str(exc) or exc.__class__.__name__
+    lower = text.lower()
+
+    if isinstance(exc, FfmpegNotFoundError):
+        return text  # already a clear, actionable message
+    if isinstance(exc, FileNotFoundError) or "no such file" in lower:
+        return "This file could not be found on disk -- it may have been moved or deleted."
+    if isinstance(exc, PermissionError) or "permission denied" in lower:
+        return "Permission denied reading this file -- check that it isn't open in another program."
+    if isinstance(exc, MemoryError) or "out of memory" in lower or "cuda out of memory" in lower:
+        return "Ran out of memory processing this file -- try a smaller Whisper model."
+    if "auth" in lower and ("modal" in lower or "token" in lower or "unauthenticated" in lower):
+        return "Modal.com rejected the provided credentials -- check the Token ID and Token Secret."
+    if isinstance(exc, (ConnectionError, TimeoutError)) or "connection" in lower or "timed out" in lower:
+        return "Could not reach Modal.com -- check your internet connection and try again."
+    if "ffmpeg failed" in lower:
+        return text  # already descriptive, from ffmpeg_utils.extract_audio
+    return text
 
 
 def _run_file_group(
@@ -64,6 +83,7 @@ def _run_file_group(
     modal_token_id: str | None,
     modal_token_secret: str | None,
     job: Job,
+    logger: logging.Logger,
 ) -> tuple[bool, str | None, float]:
     """Runs one file's steps synchronously (in a worker thread). Returns
     (succeeded, error_message, real_cost_usd)."""
@@ -74,7 +94,9 @@ def _run_file_group(
     real_cost = 0.0
 
     for step in group["steps"]:
-        job.emit({"event": "log", "text": _step_label(step, model_name, execution)})
+        label = _step_label(step, model_name, execution)
+        job.emit({"event": "log", "text": label})
+        logger.info(label)
         try:
             if step["name"] == "Audio Extraction":
                 extract_audio(abs_path, wav_path)
@@ -105,6 +127,7 @@ def _run_file_group(
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user as a log line
             message = _friendly_error(exc)
             job.emit({"event": "log", "text": f"Failed: {file_info['path']} — {message}", "fail": True})
+            logger.exception("Failed during %s on %s", step["name"], file_info["path"])
             return False, message, real_cost
 
         job.emit({"event": "step_done", "step": step["name"], "sec": step["sec"]})
@@ -124,6 +147,12 @@ async def run_job(
     modal_token_id: str | None = None,
     modal_token_secret: str | None = None,
 ) -> None:
+    logger = get_job_logger(job.id)
+    logger.info(
+        "Job %s starting: %d file(s), model=%s, execution=%s, gpu=%s, cleanup=%s",
+        job.id, len(files), model, execution, gpu, cleanup,
+    )
+
     steps = compute_steps(files, model, execution, gpu, cleanup)
     total_estimated_sec = sum(s["sec"] for s in steps) or 1.0
     groups = _group_by_file(steps)
@@ -138,11 +167,12 @@ async def run_job(
     for group in groups:
         if job.cancel_requested:
             job.emit({"event": "log", "text": "Cancelled — remaining files were not started."})
+            logger.info("Job %s cancelled before processing %s", job.id, group["file"]["path"])
             break
 
         ok, _err, real_cost = await asyncio.to_thread(
             _run_file_group, group, folder, model, formats, execution, gpu, cleanup,
-            modal_token_id, modal_token_secret, job,
+            modal_token_id, modal_token_secret, job, logger,
         )
         total_cost += real_cost
         for step in group["steps"]:
@@ -159,6 +189,11 @@ async def run_job(
     skipped = len(groups) - succeeded - failed
     total_minutes = sum(f["duration_sec"] for f in files) / 60 or 1.0
     processed = (succeeded + failed) or 1
+
+    logger.info(
+        "Job %s finished: succeeded=%d failed=%d skipped=%d cancelled=%s total_sec=%.2f total_cost=%.4f",
+        job.id, succeeded, failed, skipped, job.cancel_requested, total_sec, total_cost,
+    )
 
     job.emit({
         "event": "done",
