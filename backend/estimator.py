@@ -65,41 +65,55 @@ def compute_steps(
     cleanup: bool,
 ) -> list[dict]:
     """files: [{"path", "type", "duration_sec"}, ...] (as sent by the frontend).
-    Returns a flat, file-major ordered step list: each step is
-    {"file": <the file dict>, "name": <phase name>, "sec": float, "cost": float}.
+    Returns a flat, ordered step list -- organized *phase-wise*: every
+    file's Audio Extraction happens before anyone starts Transcription,
+    etc. -- matching the real pipeline's execution order (see
+    pipeline.py's _group_by_pass). Each step is
+    {"file": <the file dict, or None for job-level steps>, "name": <phase
+    name>, "pass": <int, execution order>, "sec": float, "cost": float}.
     """
     is_modal = execution == "modal"
     rtf = _estimate_rtf(model, execution, gpu_id)
     rate = _gpu_rate(gpu_id) if is_modal else 0.0
 
     steps: list[dict] = []
-    for i, f in enumerate(files):
+
+    # Pass 0: Audio Extraction -- every video file, independent of the rest.
+    for f in files:
         if f["type"] == "video":
-            steps.append({"file": f, "name": "Audio Extraction", "sec": (f["duration_sec"] / 60) * 2, "cost": 0.0})
-        if not is_modal and i == 0:
-            # Local model load/caching happens once per job, not per file
-            # (subsequent files reuse the already-loaded model), so this
-            # only applies to the first file -- unlike Modal's per-file
-            # setup, which is genuinely per-call since each transcription
-            # spins up a fresh ephemeral container.
-            steps.append({
-                "file": f, "name": "Whisper Model Setup",
-                "sec": _estimate_local_setup_sec(model), "cost": 0.0,
-            })
+            steps.append({"file": f, "name": "Audio Extraction", "pass": 0, "sec": (f["duration_sec"] / 60) * 2, "cost": 0.0})
+
+    # Pass 1 (local only): Whisper Model Setup -- once for the whole job,
+    # not per file (the model loads once and is reused). Modal has no
+    # equivalent standalone pass: its setup is genuinely per-file (see
+    # pass 2 below), since each call spins up a fresh ephemeral container.
+    if not is_modal:
+        steps.append({"file": None, "name": "Whisper Model Setup", "pass": 1, "sec": _estimate_local_setup_sec(model), "cost": 0.0})
+
+    # Pass 2: Transcription. For Modal this bundles Setup+Transcribe+
+    # Download into one RPC call per file (can't be split further -- see
+    # modal_app.py) -- still shown as 3 rows, but they execute together,
+    # file by file, within this one pass.
+    for f in files:
         if is_modal:
             steps.append({
-                "file": f, "name": "Modal.com Setup & Model Install",
+                "file": f, "name": "Modal.com Setup & Model Install", "pass": 2,
                 "sec": MODAL_SETUP_SEC, "cost": (MODAL_SETUP_SEC / 3600) * rate,
             })
         transcription_sec = f["duration_sec"] * rtf
         steps.append({
-            "file": f, "name": "Transcription",
+            "file": f, "name": "Transcription", "pass": 2,
             "sec": transcription_sec, "cost": (transcription_sec / 3600) * rate if is_modal else 0.0,
         })
         if is_modal:
-            steps.append({"file": f, "name": "Download Transcript to Local", "sec": MODAL_DOWNLOAD_SEC, "cost": 0.0})
-        if cleanup and f["type"] == "video":
-            steps.append({"file": f, "name": "Cleanup", "sec": 1.0, "cost": 0.0})
+            steps.append({"file": f, "name": "Download Transcript to Local", "pass": 2, "sec": MODAL_DOWNLOAD_SEC, "cost": 0.0})
+
+    # Pass 3: Cleanup -- every video file, once all transcriptions are done.
+    if cleanup:
+        for f in files:
+            if f["type"] == "video":
+                steps.append({"file": f, "name": "Cleanup", "pass": 3, "sec": 1.0, "cost": 0.0})
+
     return steps
 
 

@@ -451,7 +451,7 @@ function resetRunAndDiagnostics() {
 
 let activeJobId = null;
 let activeEventSource = null;
-let phaseStatus = {}; // { [phaseName]: { doneCount, expectedCount, failed } }, live-tracked during a run
+let phaseStatus = {}; // { [phaseName]: { doneCount, failedCount, skippedCount, expectedCount } }, live-tracked during a run
 
 // Mirrors backend/estimator.py's compute_steps() phase-assignment logic
 // (which files get which phases) so the frontend knows how many
@@ -474,7 +474,28 @@ function setPhaseIcon(phaseName, state) {
   const el = previewTableBody.querySelector(`.phase-icon[data-phase="${phaseName}"]`);
   if (!el) return;
   el.className = "phase-icon" + (state ? ` phase-icon--${state}` : "");
-  el.textContent = state === "done" ? "✓" : state === "failed" ? "✗" : "";
+  el.textContent = state === "done" ? "✓" : state === "failed" ? "✗" : state === "warning" ? "!" : "";
+}
+
+// Once every (file, phase) instance for this phase has been accounted for
+// (succeeded, failed, or skipped -- a file already failed in an earlier
+// phase is skipped in this one), finalize its icon: green only if nothing
+// failed, red only if nothing succeeded, yellow for a genuine mix of both
+// (partial success) per the user's "partial completions = yellow warning"
+// requirement. Skips alone (e.g. a phase every file happened to skip)
+// don't count as either success or failure.
+function finalizePhaseIfComplete(phaseName) {
+  const st = phaseStatus[phaseName];
+  if (!st) return;
+  const accountedFor = st.doneCount + st.failedCount + st.skippedCount;
+  if (accountedFor < st.expectedCount) return;
+  if (st.failedCount > 0 && st.doneCount > 0) {
+    setPhaseIcon(phaseName, "warning");
+  } else if (st.failedCount > 0) {
+    setPhaseIcon(phaseName, "failed");
+  } else if (st.doneCount > 0) {
+    setPhaseIcon(phaseName, "done");
+  }
 }
 
 function buildTranscribeRequest() {
@@ -562,7 +583,7 @@ beginBtn.addEventListener("click", async () => {
   const expected = computeExpectedPhaseCounts(req.files, req.execution, req.cleanup);
   phaseStatus = {};
   for (const [name, expectedCount] of Object.entries(expected)) {
-    phaseStatus[name] = { doneCount: 0, expectedCount, failed: false };
+    phaseStatus[name] = { doneCount: 0, failedCount: 0, skippedCount: 0, expectedCount };
     setPhaseIcon(name, null); // clear any icon left from a previous run
   }
 
@@ -587,17 +608,27 @@ beginBtn.addEventListener("click", async () => {
         addLogLine(event.text, !!event.fail);
       } else if (event.event === "step_start") {
         const st = phaseStatus[event.step];
-        if (st && !st.failed) setPhaseIcon(event.step, "spinner");
+        if (st && st.doneCount + st.failedCount + st.skippedCount < st.expectedCount) {
+          setPhaseIcon(event.step, "spinner");
+        }
       } else if (event.event === "step_done") {
         const st = phaseStatus[event.step];
-        if (st && !st.failed) {
+        if (st) {
           st.doneCount++;
-          setPhaseIcon(event.step, st.doneCount >= st.expectedCount ? "done" : "spinner");
+          finalizePhaseIfComplete(event.step);
         }
       } else if (event.event === "step_failed") {
         const st = phaseStatus[event.step];
-        if (st) st.failed = true;
-        setPhaseIcon(event.step, "failed");
+        if (st) {
+          st.failedCount++;
+          finalizePhaseIfComplete(event.step);
+        }
+      } else if (event.event === "step_skipped") {
+        const st = phaseStatus[event.step];
+        if (st) {
+          st.skippedCount++;
+          finalizePhaseIfComplete(event.step);
+        }
       } else if (event.event === "progress") {
         progressBar.value = event.percent;
       } else if (event.event === "done") {
