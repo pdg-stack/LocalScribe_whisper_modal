@@ -315,7 +315,6 @@ body {
 .begin-row {
   display: flex;
   justify-content: center;
-  margin-top: 14px;
 }
 
 /* Run step */

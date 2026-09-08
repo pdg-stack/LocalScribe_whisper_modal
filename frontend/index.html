@@ -109,11 +109,13 @@
           <tbody id="preview-table-body"></tbody>
         </table>
       </div>
-
-      <div id="begin-row" class="begin-row" hidden>
-        <button id="begin-btn" class="btn btn-primary">Begin</button>
-      </div>
     </section>
+
+    <!-- Begin row: its own block, outside the Preview card, only shown
+         once Preview has actually been run -->
+    <div id="begin-row" class="begin-row card" hidden>
+      <button id="begin-btn" class="btn btn-primary">Begin</button>
+    </div>
 
     <!-- Run step -->
     <section class="card" id="run-step" hidden>
