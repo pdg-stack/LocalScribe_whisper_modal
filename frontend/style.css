@@ -10,6 +10,7 @@
   --greyed: #b8b8c2;
   --success: #1e8e5a;
   --fail: #d9453d;
+  --warning: #b8860b;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -25,6 +26,7 @@
     --greyed: #4a4a55;
     --success: #4fce93;
     --fail: #ff6b63;
+    --warning: #e0b23d;
   }
 }
 
@@ -318,7 +320,8 @@ body {
 }
 
 .phase-icon--done,
-.phase-icon--failed {
+.phase-icon--failed,
+.phase-icon--warning {
   width: auto;
   height: auto;
   font-weight: 700;
@@ -327,6 +330,7 @@ body {
 
 .phase-icon--done { color: var(--success); }
 .phase-icon--failed { color: var(--fail); }
+.phase-icon--warning { color: var(--warning); }
 
 @keyframes phase-spin {
   to { transform: rotate(360deg); }
