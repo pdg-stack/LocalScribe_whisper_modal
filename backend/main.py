@@ -69,12 +69,13 @@ def api_preview(req: PreviewRequest):
 
 @app.post("/api/transcribe")
 async def api_transcribe(req: TranscribeRequest):
-    if req.execution == "modal":
-        raise HTTPException(status_code=400, detail="Modal.com execution lands in Phase 4 -- use Local for now.")
+    if req.execution == "modal" and not (req.modal_token_id and req.modal_token_secret):
+        raise HTTPException(status_code=400, detail="Modal Token ID and Token Secret are required for Modal.com execution.")
     job = create_job()
     files = [f.model_dump() for f in req.files]
     asyncio.create_task(run_job(
         job, req.folder_path, files, req.model, req.formats, req.execution, req.gpu, req.cleanup,
+        req.modal_token_id, req.modal_token_secret,
     ))
     return {"job_id": job.id}
 

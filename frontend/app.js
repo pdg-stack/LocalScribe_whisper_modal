@@ -458,8 +458,10 @@ function buildTranscribeRequest() {
     execution: mode,
     gpu: mode === "modal" ? gpuSelect.value : null,
     cleanup: cleanupCheck.checked,
-    // Phase 4 adds modal_token_id/modal_token_secret here -- held only in
-    // memory for this one request, never persisted (see updatePreviewEnabled).
+    // Held only in memory for this one request -- never written to
+    // user_prefs.json or any other file (see savePreferences()).
+    modal_token_id: mode === "modal" ? tokenIdInput.value.trim() : null,
+    modal_token_secret: mode === "modal" ? tokenSecretInput.value.trim() : null,
   };
 }
 

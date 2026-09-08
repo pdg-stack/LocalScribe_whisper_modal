@@ -10,10 +10,16 @@ import asyncio
 import time
 from pathlib import Path
 
+from backend.config import BEAM_SIZE, GPU_OPTIONS
 from backend.estimator import aggregate_phases, compute_steps
 from backend.ffmpeg_utils import extract_audio
 from backend.jobs import Job
-from backend.transcription import engine, writers
+from backend.transcription import engine, modal_app, writers
+
+
+def _gpu_rate(gpu_id: str | None) -> float:
+    gpu = next((g for g in GPU_OPTIONS if g["id"] == gpu_id), None)
+    return gpu["rate"] if gpu else 0.0
 
 
 def _group_by_file(steps: list[dict]) -> list[dict]:
@@ -52,39 +58,58 @@ def _run_file_group(
     folder_path: Path,
     model_name: str,
     formats: list[str],
+    execution: str,
+    gpu: str | None,
     cleanup: bool,
+    modal_token_id: str | None,
+    modal_token_secret: str | None,
     job: Job,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, float]:
     """Runs one file's steps synchronously (in a worker thread). Returns
-    (succeeded, error_message)."""
+    (succeeded, error_message, real_cost_usd)."""
     file_info = group["file"]
     abs_path = folder_path / file_info["path"]
     wav_path = abs_path.with_suffix(".wav") if file_info["type"] == "video" else None
     audio_path = abs_path
+    real_cost = 0.0
 
     for step in group["steps"]:
-        job.emit({"event": "log", "text": _step_label(step, model_name, "local")})
+        job.emit({"event": "log", "text": _step_label(step, model_name, execution)})
         try:
             if step["name"] == "Audio Extraction":
                 extract_audio(abs_path, wav_path)
                 audio_path = wav_path
             elif step["name"] == "Transcription":
-                model = engine.get_model(model_name, device="cpu")
-                group["_segments"] = engine.transcribe(model, audio_path)
+                if execution == "modal":
+                    started = time.perf_counter()
+                    raw = modal_app.transcribe_on_modal(
+                        audio_path.read_bytes(), model_name, gpu, BEAM_SIZE,
+                        modal_token_id, modal_token_secret,
+                    )
+                    real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
+                    group["_segments"] = [engine.Segment(**s) for s in raw]
+                else:
+                    model = engine.get_model(model_name, device="cpu")
+                    group["_segments"] = engine.transcribe(model, audio_path)
                 for fmt in formats:
                     out_path = abs_path.with_suffix(f".{fmt}")
                     writers.write_format(fmt, group["_segments"], out_path)
             elif step["name"] == "Cleanup":
                 if wav_path is not None:
                     wav_path.unlink(missing_ok=True)
+            # "Modal.com Setup & Model Install" and "Download Transcript to
+            # Local" are shown as separate rows/log lines for clarity, but
+            # both are actually covered by the single Modal RPC call made
+            # above in the Transcription step -- Modal doesn't expose
+            # granular sub-phase timing to split them further.
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user as a log line
             message = _friendly_error(exc)
             job.emit({"event": "log", "text": f"Failed: {file_info['path']} — {message}", "fail": True})
-            return False, message
+            return False, message, real_cost
 
         job.emit({"event": "step_done", "step": step["name"], "sec": step["sec"]})
 
-    return True, None
+    return True, None, real_cost
 
 
 async def run_job(
@@ -96,6 +121,8 @@ async def run_job(
     execution: str,
     gpu: str | None,
     cleanup: bool,
+    modal_token_id: str | None = None,
+    modal_token_secret: str | None = None,
 ) -> None:
     steps = compute_steps(files, model, execution, gpu, cleanup)
     total_estimated_sec = sum(s["sec"] for s in steps) or 1.0
@@ -105,6 +132,7 @@ async def run_job(
     elapsed_estimated = 0.0
     succeeded = 0
     failed = 0
+    total_cost = 0.0
     started_at = time.perf_counter()
 
     for group in groups:
@@ -112,9 +140,11 @@ async def run_job(
             job.emit({"event": "log", "text": "Cancelled — remaining files were not started."})
             break
 
-        ok, _err = await asyncio.to_thread(
-            _run_file_group, group, folder, model, formats, cleanup, job
+        ok, _err, real_cost = await asyncio.to_thread(
+            _run_file_group, group, folder, model, formats, execution, gpu, cleanup,
+            modal_token_id, modal_token_secret, job,
         )
+        total_cost += real_cost
         for step in group["steps"]:
             elapsed_estimated += step["sec"]
         job.emit({"event": "progress", "percent": min(100, round(elapsed_estimated / total_estimated_sec * 100))})
@@ -137,9 +167,9 @@ async def run_job(
         "skipped": skipped,
         "cancelled": job.cancel_requested,
         "total_sec": total_sec,
-        "total_cost": 0.0,  # local execution is always free
+        "total_cost": total_cost,  # 0 for local execution; real Modal GPU-time cost otherwise
         "per_file_sec": total_sec / processed,
-        "per_file_cost": 0.0,
+        "per_file_cost": total_cost / processed,
         "per_minute_sec": total_sec / total_minutes,
-        "per_minute_cost": 0.0,
+        "per_minute_cost": total_cost / total_minutes,
     })
