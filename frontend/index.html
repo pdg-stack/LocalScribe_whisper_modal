@@ -79,9 +79,15 @@
           <span class="hint" id="gpu-recommendation"></span>
         </div>
         <label for="modal-token-id">Modal Token ID</label>
-        <input type="password" id="modal-token-id" autocomplete="off" />
+        <div class="password-field">
+          <input type="password" id="modal-token-id" autocomplete="off" />
+          <button type="button" class="eye-toggle" data-target="modal-token-id" aria-label="Show Modal Token ID"></button>
+        </div>
         <label for="modal-token-secret">Modal Token Secret</label>
-        <input type="password" id="modal-token-secret" autocomplete="off" />
+        <div class="password-field">
+          <input type="password" id="modal-token-secret" autocomplete="off" />
+          <button type="button" class="eye-toggle" data-target="modal-token-secret" aria-label="Show Modal Token Secret"></button>
+        </div>
       </div>
 
       <div class="field-row">
@@ -100,6 +106,9 @@
           </thead>
           <tbody id="preview-table-body"></tbody>
         </table>
+      </div>
+
+      <div id="begin-row" class="begin-row" hidden>
         <button id="begin-btn" class="btn btn-primary">Begin</button>
       </div>
     </section>

@@ -97,7 +97,7 @@ body {
   border-color: var(--accent);
 }
 
-.btn-primary:disabled {
+.btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -164,13 +164,19 @@ body {
   padding-left: 22px;
 }
 
-.type-row.greyed {
-  color: var(--greyed);
-  pointer-events: none;
+.file-row td.col-label {
+  padding-left: 46px;
+  font-weight: 400;
 }
 
-.type-row.greyed input {
-  pointer-events: none;
+/* Greying applies to text/number color only (label, count, size, duration)
+   for the inactive scope's rows -- the radio button and accordion toggle
+   stay fully interactive regardless (only the select-all/file checkboxes
+   get the `disabled` attribute). */
+.scope-row.greyed,
+.type-row.greyed,
+.file-row.greyed {
+  color: var(--greyed);
 }
 
 .accordion-toggle {
@@ -179,16 +185,6 @@ body {
   display: inline-block;
   user-select: none;
   color: var(--text-dim);
-}
-
-.type-row.greyed .accordion-toggle {
-  cursor: default;
-}
-
-.file-row td.col-label {
-  padding-left: 46px;
-  color: var(--text-dim);
-  font-weight: 400;
 }
 
 .file-row.hidden-row {
@@ -213,7 +209,8 @@ body {
 }
 
 .field-row select,
-.field-row input[type="password"] {
+.field-row input[type="password"],
+.field-row input[type="text"] {
   padding: 6px 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -222,6 +219,40 @@ body {
   width: 100%;
   max-width: 320px;
   margin-bottom: 6px;
+}
+
+.password-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+}
+
+.password-field input {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+}
+
+.eye-toggle {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card-bg);
+  color: var(--text-dim);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 6px;
+}
+
+.eye-toggle svg {
+  width: 16px;
+  height: 16px;
 }
 
 .inline-checks {
@@ -274,6 +305,12 @@ body {
 }
 
 .preview-panel {
+  margin-top: 14px;
+}
+
+.begin-row {
+  display: flex;
+  justify-content: center;
   margin-top: 14px;
 }
 

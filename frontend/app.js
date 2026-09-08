@@ -153,7 +153,7 @@ function renderScanTable() {
     const stats = combinedScopeStats(scopeKey);
 
     const scopeRow = document.createElement("tr");
-    scopeRow.className = "scope-row";
+    scopeRow.className = "scope-row" + (active ? "" : " greyed");
     scopeRow.innerHTML = `
       <td class="col-label">
         <input type="radio" name="scope" value="${scopeKey}" ${active ? "checked" : ""} />
@@ -193,7 +193,8 @@ function renderScanTable() {
       checkbox.indeterminate = someSelected;
 
       typeRow.querySelector(".accordion-toggle").addEventListener("click", () => {
-        if (!active) return;
+        // Accordion works regardless of whether this scope is active --
+        // only selecting files requires switching to it first.
         state.expanded[scopeKey][type] = !state.expanded[scopeKey][type];
         renderScanTable();
       });
@@ -298,15 +299,37 @@ GPU_OPTIONS.forEach((gpu) => {
 });
 gpuRecommendation.textContent = `Recommended: ${RECOMMENDED_GPU} — best cost/throughput balance for Whisper inference`;
 
+// ---------- Show/hide toggle for Modal token fields (copy/paste/cut are
+// never blocked -- neither <input type=password> nor this toggle does
+// anything that would prevent clipboard use) ----------
+
+const EYE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19c-7 0-11-7-11-7a21.86 21.86 0 0 1 5.06-6.06M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 7 11 7a21.86 21.86 0 0 1-2.16 3.19M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+
+document.querySelectorAll(".eye-toggle").forEach((btn) => {
+  btn.innerHTML = EYE_ICON;
+  btn.addEventListener("click", () => {
+    const input = document.getElementById(btn.dataset.target);
+    const reveal = input.type === "password";
+    input.type = reveal ? "text" : "password";
+    btn.innerHTML = reveal ? EYE_OFF_ICON : EYE_ICON;
+    const labelEl = document.querySelector(`label[for="${btn.dataset.target}"]`);
+    btn.setAttribute("aria-label", (reveal ? "Hide " : "Show ") + (labelEl ? labelEl.textContent : "value"));
+  });
+});
+
 function currentExecutionMode() {
   for (const r of executionRadios) if (r.checked) return r.value;
   return "local";
 }
 
 function renderOptionsVisibility() {
-  const hasSelection = selectedFilesInActiveScope().length > 0;
-  optionsStep.hidden = !hasSelection;
-  actionStep.hidden = !hasSelection;
+  // Model/formats/execution/Preview are shown as soon as a scan has run,
+  // regardless of whether any files are checked yet -- Preview's own
+  // enabled/disabled state is what gates on selection (see below).
+  const hasScan = !!state.scanData;
+  optionsStep.hidden = !hasScan;
+  actionStep.hidden = !hasScan;
   updatePreviewEnabled();
 }
 
@@ -373,6 +396,7 @@ function loadPreferences() {
 
 const previewPanel = document.getElementById("preview-panel");
 const previewTableBody = document.getElementById("preview-table-body");
+const beginRow = document.getElementById("begin-row");
 const beginBtn = document.getElementById("begin-btn");
 const runStep = document.getElementById("run-step");
 const progressBar = document.getElementById("progress-bar");
@@ -382,35 +406,86 @@ const diagnosticsStep = document.getElementById("diagnostics-step");
 const diagnosticsSummary = document.getElementById("diagnostics-summary");
 const diagnosticsTableBody = document.getElementById("diagnostics-table-body");
 
+// Modal.com phases are per-file since each transcription call is an
+// ephemeral instance (see transcription/modal_app.py in the plan) --
+// setup/model-install happens fresh per file, same for the download back.
+// These are placeholder constants for the Preview demo; Phase 3/4 replace
+// them with backend estimator.py's real figures.
+const MODAL_SETUP_SEC = 20; // cold start: spin instance + install/load model
+const MODAL_DOWNLOAD_SEC = 2; // transcript result back to local
+
 function computeEstimate() {
   const files = selectedFilesInActiveScope();
   const model = modelSelect.value;
   const mode = currentExecutionMode();
   const rtfTable = mode === "modal" ? RTF_MODAL_GPU : RTF_LOCAL_CPU;
   const rtf = rtfTable[model];
+  const gpu = mode === "modal" ? GPU_OPTIONS.find((g) => g.id === gpuSelect.value) : null;
+  const doCleanup = cleanupCheck.checked;
 
-  let extractionSec = 0;
-  let transcriptionSec = 0;
+  const PHASE_ORDER = mode === "modal"
+    ? ["Audio Extraction", "Modal.com Setup & Model Install", "Transcription", "Download Transcript to Local", "Cleanup"]
+    : ["Audio Extraction", "Transcription", "Cleanup"];
+
+  // Flat, file-major ordered list -- mirrors the real per-file pipeline
+  // (extract -> [modal setup] -> transcribe -> [download] -> cleanup) so
+  // it can drive both the Preview totals and the weighted progress bar.
+  const steps = [];
   for (const f of files) {
-    if (f.type === "video") extractionSec += (f.duration_sec / 60) * 2; // ~2s/min source
-    transcriptionSec += f.duration_sec * rtf;
+    if (f.type === "video") {
+      steps.push({ file: f, name: "Audio Extraction", sec: (f.duration_sec / 60) * 2, cost: 0 }); // ~2s/min source
+    }
+    if (mode === "modal") {
+      steps.push({ file: f, name: "Modal.com Setup & Model Install", sec: MODAL_SETUP_SEC, cost: (MODAL_SETUP_SEC / 3600) * gpu.rate });
+    }
+    const transcriptionSec = f.duration_sec * rtf;
+    steps.push({
+      file: f,
+      name: "Transcription",
+      sec: transcriptionSec,
+      cost: mode === "modal" ? (transcriptionSec / 3600) * gpu.rate : 0,
+    });
+    if (mode === "modal") {
+      steps.push({ file: f, name: "Download Transcript to Local", sec: MODAL_DOWNLOAD_SEC, cost: 0 });
+    }
+    if (doCleanup && f.type === "video") {
+      steps.push({ file: f, name: "Cleanup", sec: 1, cost: 0 });
+    }
   }
-  const cleanupSec = cleanupCheck.checked ? files.filter((f) => f.type === "video").length * 1 : 0;
 
-  let extractionCost = 0, transcriptionCost = 0, cleanupCost = 0;
-  if (mode === "modal") {
-    const gpu = GPU_OPTIONS.find((g) => g.id === gpuSelect.value);
-    transcriptionCost = (transcriptionSec / 3600) * gpu.rate;
+  const totalsByName = {};
+  for (const name of PHASE_ORDER) totalsByName[name] = { sec: 0, cost: 0 };
+  for (const s of steps) { totalsByName[s.name].sec += s.sec; totalsByName[s.name].cost += s.cost; }
+
+  const phases = PHASE_ORDER
+    .filter((name) => name !== "Cleanup" || doCleanup)
+    .map((name) => ({ name, sec: totalsByName[name].sec, cost: totalsByName[name].cost }));
+
+  return { phases, steps, files };
+}
+
+function groupStepsByFile(steps) {
+  const groups = [];
+  let current = null;
+  for (const s of steps) {
+    if (!current || current.file !== s.file) {
+      current = { file: s.file, steps: [] };
+      groups.push(current);
+    }
+    current.steps.push(s);
   }
+  return groups;
+}
 
-  return {
-    phases: [
-      { name: "Audio Extraction", sec: extractionSec, cost: extractionCost },
-      { name: "Transcription", sec: transcriptionSec, cost: transcriptionCost },
-      ...(cleanupCheck.checked ? [{ name: "Cleanup", sec: cleanupSec, cost: cleanupCost }] : []),
-    ],
-    files,
-  };
+function stepLogLabel(step, model, mode) {
+  switch (step.name) {
+    case "Audio Extraction": return `Extracting audio: ${step.file.path}`;
+    case "Modal.com Setup & Model Install": return `Setting up Modal.com & installing ${model} model: ${step.file.path}`;
+    case "Transcription": return `Transcribing (${mode}, ${model}): ${step.file.path}`;
+    case "Download Transcript to Local": return `Downloading transcript: ${step.file.path}`;
+    case "Cleanup": return `Cleaning up intermediate audio: ${step.file.path}`;
+    default: return `${step.name}: ${step.file.path}`;
+  }
 }
 
 previewBtn.addEventListener("click", () => {
@@ -430,6 +505,7 @@ previewBtn.addEventListener("click", () => {
   previewTableBody.appendChild(totalRow);
 
   previewPanel.hidden = false;
+  beginRow.hidden = false;
 });
 
 function addLogLine(text, isFail) {
@@ -442,9 +518,13 @@ function addLogLine(text, isFail) {
 
 beginBtn.addEventListener("click", () => {
   // Phase 3/4 replace this simulated run with real /api/transcribe +
-  // /api/jobs/{id}/stream (SSE) + /api/jobs/{id}/cancel.
+  // /api/jobs/{id}/stream (SSE) + /api/jobs/{id}/cancel. The progress bar
+  // is weighted by each step's estimated seconds (same figures as the
+  // Preview table), not just a raw file count.
   const estimate = computeEstimate();
-  const files = estimate.files;
+  const groups = groupStepsByFile(estimate.steps);
+  const totalSec = estimate.steps.reduce((s, st) => s + st.sec, 0) || 1;
+
   runStep.hidden = false;
   diagnosticsStep.hidden = true;
   logBox.innerHTML = "";
@@ -455,7 +535,8 @@ beginBtn.addEventListener("click", () => {
 
   const model = modelSelect.value;
   const mode = currentExecutionMode();
-  let i = 0;
+  let elapsedSec = 0;
+  let gi = 0, si = 0;
   let succeeded = 0, failed = 0;
 
   function processNext() {
@@ -464,32 +545,41 @@ beginBtn.addEventListener("click", () => {
       finishRun(true);
       return;
     }
-    if (i >= files.length) {
+    if (gi >= groups.length) {
       finishRun(false);
       return;
     }
-    const f = files[i];
-    if (f.type === "video") addLogLine(`Extracting audio: ${f.path}`);
-    addLogLine(`Transcribing (${mode}, ${model}): ${f.path}`);
-
-    const willFail = i === files.length - 1 && files.length > 2; // demo: last file fails sometimes
-    setTimeout(() => {
-      if (willFail) {
-        addLogLine(`Failed: ${f.path} — ffmpeg could not read this file`, true);
-        failed++;
-      } else {
-        addLogLine(`Done: ${f.path}`);
-        succeeded++;
-      }
-      i++;
-      progressBar.value = Math.round((i / files.length) * 100);
+    const group = groups[gi];
+    if (si >= group.steps.length) {
+      addLogLine(`Done: ${group.file.path}`);
+      succeeded++;
+      gi++; si = 0;
       processNext();
-    }, 250);
+      return;
+    }
+    const step = group.steps[si];
+    addLogLine(stepLogLabel(step, model, mode));
+
+    const isLastFile = gi === groups.length - 1;
+    const willFail = step.name === "Transcription" && isLastFile && groups.length > 2; // demo-only
+
+    setTimeout(() => {
+      elapsedSec += step.sec;
+      progressBar.value = Math.min(100, Math.round((elapsedSec / totalSec) * 100));
+      if (willFail) {
+        addLogLine(`Failed: ${group.file.path} — ffmpeg could not read this file`, true);
+        failed++;
+        gi++; si = 0; // skip this file's remaining steps
+      } else {
+        si++;
+      }
+      processNext();
+    }, 120);
   }
 
   function finishRun(wasCancelled) {
-    cancelBtn.disabled = true;
-    showDiagnostics(estimate, succeeded, failed, files.length - succeeded - failed, wasCancelled);
+    cancelBtn.disabled = true; // job is over (finished or cancelled) -- nothing left to cancel
+    showDiagnostics(estimate, succeeded, failed, groups.length - succeeded - failed, wasCancelled);
   }
 
   processNext();
