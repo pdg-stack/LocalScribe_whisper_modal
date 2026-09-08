@@ -1,57 +1,7 @@
-// Phase 1 prototype: everything below runs against MOCK_SCAN / client-side
-// estimate math. Phase 2 replaces the scan with a real /api/scan call;
-// Phase 3/4 replace the Preview/Begin estimate + run logic with real
-// /api/preview, /api/transcribe, /api/jobs/{id}/stream calls; Phase 2 also
-// wires preferences to GET/POST /api/preferences instead of localStorage.
-
-// ---------- Mock data ----------
-
-function mockFile(path, durationSec, sizeBytes) {
-  return { path, duration_sec: durationSec, size_bytes: sizeBytes };
-}
-
-const MOCK_SCAN = {
-  folder: "D:\\Videos\\SampleProject",
-  scopes: {
-    current: {
-      video: {
-        files: [
-          mockFile("intro.mp4", 92, 18_000_000),
-          mockFile("subdir\\outro.mov", 64, 40_000_000),
-          mockFile("raw_footage.mkv", 720, 900_000_000),
-          mockFile("interview_pt1.mp4", 1980, 210_000_000),
-        ],
-      },
-      audio: {
-        files: [
-          mockFile("notes.mp3", 480, 8_000_000),
-          mockFile("call_recording.wav", 1620, 160_000_000),
-        ],
-      },
-    },
-    all: {
-      video: {
-        files: [
-          mockFile("intro.mp4", 92, 18_000_000),
-          mockFile("subdir\\outro.mov", 64, 40_000_000),
-          mockFile("raw_footage.mkv", 720, 900_000_000),
-          mockFile("interview_pt1.mp4", 1980, 210_000_000),
-          mockFile("archive\\2024\\keynote.mp4", 3600, 1_200_000_000),
-          mockFile("archive\\2024\\panel.mp4", 3900, 1_300_000_000),
-          mockFile("archive\\2025\\demo.mov", 1500, 500_000_000),
-        ],
-      },
-      audio: {
-        files: [
-          mockFile("notes.mp3", 480, 8_000_000),
-          mockFile("call_recording.wav", 1620, 160_000_000),
-          mockFile("archive\\2024\\podcast_ep1.mp3", 2700, 55_000_000),
-          mockFile("archive\\2025\\podcast_ep2.mp3", 2800, 57_000_000),
-        ],
-      },
-    },
-  },
-};
+// Phase 2+: scan and preferences are wired to the real FastAPI backend
+// (/api/scan, /api/preferences). Phase 3/4 still replace the Preview/Begin
+// estimate + run logic with real /api/preview, /api/transcribe,
+// /api/jobs/{id}/stream calls.
 
 const GPU_OPTIONS = [
   { id: "T4", label: "T4", rate: 0.59 },
@@ -255,7 +205,7 @@ const selectionStep = document.getElementById("selection-step");
 const optionsStep = document.getElementById("options-step");
 const actionStep = document.getElementById("action-step");
 
-analyzeBtn.addEventListener("click", () => {
+analyzeBtn.addEventListener("click", async () => {
   const path = folderPathInput.value.trim();
   if (!path) {
     folderStatus.textContent = "Enter a folder path first.";
@@ -266,16 +216,31 @@ analyzeBtn.addEventListener("click", () => {
   folderStatus.textContent = "Scanning…";
   folderStatus.className = "status";
   folderStatus.hidden = false;
+  analyzeBtn.disabled = true;
 
-  // Phase 2 replaces this with: await fetch('/api/scan', {method:'POST', body: JSON.stringify({folder_path: path})})
-  setTimeout(() => {
-    state.scanData = MOCK_SCAN;
+  try {
+    const res = await fetch("/api/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder_path: path }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `Scan failed (HTTP ${res.status})`);
+    }
+    state.scanData = await res.json();
     folderStatus.hidden = true;
     selectionStep.hidden = false;
     renderScanTable();
-    loadPreferences();
+    await loadPreferences();
     renderOptionsVisibility();
-  }, 300);
+  } catch (err) {
+    folderStatus.textContent = err.message || "Could not scan that folder.";
+    folderStatus.className = "status error";
+    folderStatus.hidden = false;
+  } finally {
+    analyzeBtn.disabled = false;
+  }
 });
 
 resetBtn.addEventListener("click", () => {
@@ -402,13 +367,11 @@ executionRadios.forEach((r) =>
 );
 cleanupCheck.addEventListener("change", () => { updatePreviewEnabled(); savePreferences(); });
 
-// ---------- Preferences (localStorage placeholder for Phase 1; Phase 2
-// swaps this for GET/POST /api/preferences against user_prefs.json —
-// credentials are NEVER persisted, only model/formats/execution/gpu) ----------
+// ---------- Preferences (GET/POST /api/preferences against
+// user_prefs.json — credentials are NEVER sent or persisted, only
+// model/formats/execution/gpu) ----------
 
-const PREFS_KEY = "localscribe_prefs_v1";
-
-function savePreferences() {
+async function savePreferences() {
   const prefs = {
     model: modelSelect.value,
     formats: [...formatChecks.querySelectorAll("input[type=checkbox]:checked")].map((c) => c.value),
@@ -416,12 +379,21 @@ function savePreferences() {
     gpu: gpuSelect.value,
     cleanup: cleanupCheck.checked,
   };
-  try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch (e) { /* ignore */ }
+  try {
+    await fetch("/api/preferences", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(prefs),
+    });
+  } catch (e) { /* best-effort -- a failed save just means prefs won't persist */ }
 }
 
-function loadPreferences() {
+async function loadPreferences() {
   let prefs;
-  try { prefs = JSON.parse(localStorage.getItem(PREFS_KEY) || "null"); } catch (e) { prefs = null; }
+  try {
+    const res = await fetch("/api/preferences");
+    prefs = res.ok ? await res.json() : null;
+  } catch (e) { prefs = null; }
   if (!prefs) return;
   if (prefs.model) modelSelect.value = prefs.model;
   if (prefs.formats) {
