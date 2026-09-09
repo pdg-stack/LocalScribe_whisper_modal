@@ -55,6 +55,17 @@
       </div>
 
       <div class="field-row">
+        <label for="hf-token">
+          <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener noreferrer">Hugging Face Token</a>
+          <span class="hint">(optional -- raises the model-download rate limit)</span>
+        </label>
+        <div class="password-field">
+          <input type="password" id="hf-token" autocomplete="off" />
+          <button type="button" class="eye-toggle" data-target="hf-token" aria-label="Show Hugging Face Token"></button>
+        </div>
+      </div>
+
+      <div class="field-row">
         <label>Output formats</label>
         <div class="inline-checks" id="format-checks">
           <label><input type="checkbox" value="txt" checked /> txt</label>

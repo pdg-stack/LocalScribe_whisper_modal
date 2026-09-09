@@ -280,6 +280,7 @@ const gpuRecommendation = document.getElementById("gpu-recommendation");
 const modelSelect = document.getElementById("model-select");
 const tokenIdInput = document.getElementById("modal-token-id");
 const tokenSecretInput = document.getElementById("modal-token-secret");
+const hfTokenInput = document.getElementById("hf-token");
 const cleanupCheck = document.getElementById("cleanup-check");
 const previewBtn = document.getElementById("preview-btn");
 
@@ -352,7 +353,7 @@ function updatePreviewEnabled() {
   invalidatePreview();
 }
 
-[formatChecks, tokenIdInput, tokenSecretInput, gpuSelect, modelSelect].forEach((el) => {
+[formatChecks, tokenIdInput, tokenSecretInput, hfTokenInput, gpuSelect, modelSelect].forEach((el) => {
   el.addEventListener("input", () => { updatePreviewEnabled(); savePreferences(); });
   el.addEventListener("change", () => { updatePreviewEnabled(); savePreferences(); });
 });
@@ -368,8 +369,9 @@ executionRadios.forEach((r) =>
 cleanupCheck.addEventListener("change", () => { updatePreviewEnabled(); savePreferences(); });
 
 // ---------- Preferences (GET/POST /api/preferences against
-// user_prefs.json — credentials are NEVER sent or persisted, only
-// model/formats/execution/gpu) ----------
+// user_prefs.json -- model/formats/execution/gpu, and (at the user's
+// request) the Modal + Hugging Face credentials below, all in plaintext,
+// gitignored, local-only) ----------
 
 async function savePreferences() {
   const prefs = {
@@ -382,6 +384,7 @@ async function savePreferences() {
     // stored in plaintext in user_prefs.json (gitignored, local-only).
     modal_token_id: tokenIdInput.value.trim() || null,
     modal_token_secret: tokenSecretInput.value.trim() || null,
+    hf_token: hfTokenInput.value.trim() || null,
   };
   try {
     await fetch("/api/preferences", {
@@ -414,6 +417,7 @@ async function loadPreferences() {
   if (typeof prefs.cleanup === "boolean") cleanupCheck.checked = prefs.cleanup;
   if (prefs.modal_token_id) tokenIdInput.value = prefs.modal_token_id;
   if (prefs.modal_token_secret) tokenSecretInput.value = prefs.modal_token_secret;
+  if (prefs.hf_token) hfTokenInput.value = prefs.hf_token;
   updatePreviewEnabled();
 }
 
@@ -515,6 +519,10 @@ function buildTranscribeRequest() {
     // the user doesn't have to re-enter them each time.
     modal_token_id: mode === "modal" ? tokenIdInput.value.trim() : null,
     modal_token_secret: mode === "modal" ? tokenSecretInput.value.trim() : null,
+    // Applies to both execution modes -- Hugging Face rate-limits the
+    // model download whether it happens locally or inside a Modal
+    // container, not just for Modal execution.
+    hf_token: hfTokenInput.value.trim() || null,
   };
 }
 
@@ -660,12 +668,14 @@ cancelBtn.addEventListener("click", async () => {
   if (!activeJobId) return;
   cancelBtn.disabled = true;
   cancelBtn.textContent = "Cancelling…";
-  addLogLine("Cancelling… the current file is finishing first.");
+  addLogLine("Cancelling… stopping the current step and cleaning up.");
   try {
     await fetch(`/api/jobs/${activeJobId}/cancel`, { method: "POST" });
   } catch (e) { /* the stream's onerror handler covers a dropped connection */ }
-  // Button stays disabled/"Cancelling…" until the "done" SSE event lands
-  // (finishRun-equivalent above resets text to "Cancel" once it actually stops).
+  // Button stays disabled/"Cancelling…" until the "done" SSE event lands --
+  // the backend interrupts the in-flight step immediately, but Cleanup
+  // still runs unconditionally afterward, so "done" (and this button
+  // resetting to "Cancel") can lag a little behind the click.
 });
 
 function showDiagnostics(result) {

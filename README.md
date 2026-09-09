@@ -64,9 +64,11 @@ either on your own machine (CPU) or on [Modal.com](https://modal.com) GPUs.
    the type-level checkbox to select all of that type at once).
 3. Choose a model, output format(s), and execution (Local or Modal.com).
 4. Click **Preview** to see estimated time/cost per phase, then **Begin**.
-5. Watch progress; **Cancel** stops the job after the file currently in
-   flight finishes (transcription can't be interrupted cleanly
-   mid-inference).
+5. Watch progress; **Cancel** interrupts the step currently in flight
+   immediately (it doesn't wait for the current file to finish) — Cleanup
+   still runs afterward for any file that got an intermediate WAV
+   extracted, so "Cancelling…" can take a few seconds to settle while that
+   finishes.
 6. Review the diagnostics summary once it's done.
 
 Output files land next to the source file with the same base name (e.g.

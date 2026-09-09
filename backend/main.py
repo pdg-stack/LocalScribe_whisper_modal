@@ -75,7 +75,7 @@ async def api_transcribe(req: TranscribeRequest):
     files = [f.model_dump() for f in req.files]
     asyncio.create_task(run_job(
         job, req.folder_path, files, req.model, req.formats, req.execution, req.gpu, req.cleanup,
-        req.modal_token_id, req.modal_token_secret,
+        req.modal_token_id, req.modal_token_secret, req.hf_token,
     ))
     return {"job_id": job.id}
 

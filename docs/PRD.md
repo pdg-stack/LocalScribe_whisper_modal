@@ -33,8 +33,9 @@ only), streaming/live audio.
    Modal.com — with GPU type + Modal credentials if remote), and whether to
    delete intermediate audio files afterward.
 4. Click **Preview** to see estimated time/cost per phase, then **Begin**.
-5. Watch a progress bar and concise status log; **Cancel** if needed
-   (best-effort — the in-flight file finishes first).
+5. Watch a progress bar and concise status log; **Cancel** if needed —
+   interrupts the in-flight step immediately, then Cleanup still runs for
+   any file with an extracted intermediate WAV.
 6. Review the diagnostics summary (succeeded/failed counts, actual
    time/cost totals) once the run ends.
 
@@ -84,10 +85,16 @@ only), streaming/live audio.
   reveals **Begin**.
 - **Begin** starts the job: overall progress bar, capped-height
   auto-scrolling status log, and a **Cancel** button.
-- **Cancel** is best-effort/cooperative: stops dispatching new files and
-  terminates the in-flight ffmpeg/Modal call where possible, but lets an
-  in-flight local Whisper inference finish rather than interrupting it
-  mid-inference.
+- **Cancel** interrupts the in-flight step immediately rather than
+  letting it run to completion: it kills an in-flight ffmpeg extraction,
+  stops a local Whisper transcription between segments (the earliest
+  point a lazily-computed segment generator can be checked), and cancels
+  an in-flight Modal RPC (terminating the remote container, which also
+  stops billing for it). Cleanup then still runs unconditionally
+  afterward for every file that has an extracted intermediate WAV on
+  disk, whether or not that file's later phase completed or failed — so
+  "Cancelling…" can take a few seconds to settle while Cleanup finishes,
+  even though the step that was actually running stopped immediately.
 
 ### 4.5 Per-file pipeline
 1. Extract audio via ffmpeg to a 16kHz mono WAV (same basename/folder as

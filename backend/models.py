@@ -20,6 +20,11 @@ class PreferencesModel(BaseModel):
     # (gitignored, local-only, never transmitted anywhere but Modal).
     modal_token_id: str | None = None
     modal_token_secret: str | None = None
+    # Optional: raises the Hugging Face Hub rate limit for downloading
+    # Whisper model weights (unauthenticated requests are capped lower).
+    # Never transmitted anywhere but Hugging Face itself, and only ever
+    # set as an env var for the process/container doing the download.
+    hf_token: str | None = None
 
 
 class FileRef(BaseModel):
@@ -38,6 +43,7 @@ class TranscribeRequest(BaseModel):
     cleanup: bool = False
     modal_token_id: str | None = None
     modal_token_secret: str | None = None
+    hf_token: str | None = None
 
 
 class PreviewRequest(TranscribeRequest):
