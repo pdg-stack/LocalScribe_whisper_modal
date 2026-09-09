@@ -16,12 +16,19 @@ either on your own machine (CPU) or on [Modal.com](https://modal.com) GPUs.
 - Choose a Whisper model (`tiny` … `large-v3-turbo`), one or more output
   formats (`txt`, `srt`, `vtt`, `json`, `tsv`), and where it runs — your
   own CPU, or a Modal.com GPU.
-- Preview estimated time/cost per phase before committing, then run with
-  a live progress bar, a status log, and the option to cancel mid-run.
+- Preview estimated time/cost per phase before committing — estimates
+  self-calibrate against your own machine's/GPU's real measured
+  performance over time, not just a static guess.
+- Run with a live progress bar, a per-phase status icon next to each row
+  (spinner → green check, red cross, or yellow for a partial mix of
+  success/failure), and a status log.
+- **Cancel** interrupts the step currently in flight immediately, rather
+  than waiting for the current file to finish.
 - A diagnostics summary (real measured time/cost, not just the estimate)
   once a run finishes.
 - Optionally deletes the intermediate audio file it extracts from video,
-  never a file you already had.
+  never a file you already had — cleanup still runs even if a later
+  phase failed or the job was cancelled.
 
 ## Setup
 
@@ -100,12 +107,20 @@ credentials you enter in the UI. (If you separately use the `modal` CLI
 for other things, note that a manually-configured local profile is
 overridden by whatever credentials the app sends for its own requests.)
 
+Model weights are cached in a Modal Volume across runs, so only the
+first Modal run for a given model size re-downloads it. Optionally, add
+a [Hugging Face token](https://huggingface.co/settings/tokens) in the
+Options panel (applies to both Local and Modal execution) to raise the
+download rate limit for that first download — unauthenticated requests
+are capped lower and can occasionally get rate-limited.
+
 ## Logs
 
-Every transcription job writes a JSON-line log file to `logs/<job_id>.jsonl`
-(created at runtime, gitignored, never committed) with full detail —
-including full tracebacks for failures — for troubleshooting beyond the
-short, friendly message shown in the UI.
+Every transcription job writes a JSON-line log file to
+`logs/<timestamp>_<short-job-id>.jsonl` (created at runtime, gitignored,
+never committed), timestamped so the most recent run is easy to spot,
+with full detail — including full tracebacks for failures — for
+troubleshooting beyond the short, friendly message shown in the UI.
 
 ## Project structure
 
