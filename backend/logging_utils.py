@@ -30,7 +30,12 @@ def get_job_logger(job_id: str) -> logging.Logger:
     logger = logging.getLogger(f"localscribe.job.{job_id}")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
-        handler = logging.FileHandler(LOGS_DIR / f"{job_id}.jsonl", encoding="utf-8")
+        # Local-time prefix so files sort chronologically and the most
+        # recent run is obvious at a glance; the short job_id suffix keeps
+        # filenames unique without needing the full UUID.
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"{stamp}_{job_id[:8]}.jsonl"
+        handler = logging.FileHandler(LOGS_DIR / filename, encoding="utf-8")
         handler.setFormatter(JsonLineFormatter())
         logger.addHandler(handler)
         logger.propagate = False

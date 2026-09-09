@@ -3,7 +3,11 @@
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
+from typing import Callable
+
+from backend.jobs import StepCancelled
 
 
 class FfmpegNotFoundError(RuntimeError):
@@ -51,18 +55,40 @@ def probe_duration_seconds(file_path: Path) -> float:
         return 0.0
 
 
-def extract_audio(source_path: Path, wav_path: Path) -> None:
-    """Extract a 16kHz mono WAV from source_path via ffmpeg, overwriting wav_path."""
+def extract_audio(source_path: Path, wav_path: Path, should_cancel: Callable[[], bool] | None = None) -> None:
+    """Extract a 16kHz mono WAV from source_path via ffmpeg, overwriting wav_path.
+
+    Runs the process via Popen and polls it (rather than a single blocking
+    subprocess.run) so should_cancel() can be checked every 200ms and the
+    ffmpeg process killed immediately, instead of waiting for it to finish
+    on its own -- polling communicate() with a timeout and retrying on
+    TimeoutExpired is the documented way to do this."""
     ffmpeg = find_ffmpeg()
-    result = subprocess.run(
+    proc = subprocess.Popen(
         [
             ffmpeg, "-y", "-i", str(source_path),
             "-vn", "-ac", "1", "-ar", "16000",
             str(wav_path),
         ],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=3600,
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed to extract audio from {source_path.name}: {result.stderr[-500:]}")
+    started = time.monotonic()
+    stderr = ""
+    while True:
+        try:
+            _stdout, stderr = proc.communicate(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            if should_cancel is not None and should_cancel():
+                proc.kill()
+                proc.communicate()
+                raise StepCancelled(f"Audio extraction cancelled: {source_path.name}") from None
+            if time.monotonic() - started > 3600:
+                proc.kill()
+                proc.communicate()
+                raise RuntimeError(f"ffmpeg timed out extracting audio from {source_path.name}")
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed to extract audio from {source_path.name}: {stderr[-500:]}")

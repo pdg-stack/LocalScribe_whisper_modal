@@ -9,6 +9,12 @@ import uuid
 from dataclasses import dataclass, field
 
 
+class StepCancelled(Exception):
+    """Raised from inside a running step (ffmpeg extraction, local Whisper
+    inference, a Modal RPC) when it notices job.cancel_requested mid-flight
+    and has stopped itself early, rather than running to completion."""
+
+
 @dataclass
 class Job:
     id: str

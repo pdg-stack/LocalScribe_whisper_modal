@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import Counter
 from pathlib import Path
@@ -23,7 +24,7 @@ from backend import calibration
 from backend.config import BEAM_SIZE, GPU_OPTIONS
 from backend.estimator import aggregate_phases, compute_steps
 from backend.ffmpeg_utils import FfmpegNotFoundError, extract_audio
-from backend.jobs import Job
+from backend.jobs import Job, StepCancelled
 from backend.logging_utils import get_job_logger
 from backend.transcription import engine, modal_app, writers
 
@@ -92,13 +93,21 @@ def _run_single_step(
     gpu: str | None,
     modal_token_id: str | None,
     modal_token_secret: str | None,
+    hf_token: str | None,
     job: Job,
     logger: logging.Logger,
     file_state: dict,
-) -> tuple[bool, str | None, float]:
+) -> tuple[str, str | None, float]:
     """Runs exactly one step (one file's one phase, or a job-level step
     when step["file"] is None) synchronously in a worker thread. Returns
-    (succeeded, error_message, real_cost_usd)."""
+    (outcome, error_message, real_cost_usd), where outcome is "ok",
+    "failed", or "cancelled" -- a cancelled step is deliberately not
+    "failed": it doesn't add the file to failed_files, since the file
+    didn't error out, the user just stopped the job. should_cancel() is
+    threaded into the actual blocking work (ffmpeg subprocess, Whisper
+    segment loop, Modal RPC poll) below so a Cancel click interrupts
+    whichever step is in flight immediately, rather than waiting for it
+    to run to completion."""
     file_info = step["file"]
     label = _step_label(step, model_name, execution)
     job.emit({"event": "log", "text": label})
@@ -106,14 +115,31 @@ def _run_single_step(
     logger.info(label)
     real_cost = 0.0
 
+    def should_cancel() -> bool:
+        return job.cancel_requested
+
     try:
         if step["name"] == "Audio Extraction":
             abs_path = folder_path / file_info["path"]
             wav_path = abs_path.with_suffix(".wav")
-            extract_audio(abs_path, wav_path)
+            try:
+                extract_audio(abs_path, wav_path, should_cancel=should_cancel)
+            except StepCancelled:
+                # ffmpeg may have already written a partial file before
+                # being killed -- record it so the unconditional Cleanup
+                # pass still removes it rather than leaving it orphaned.
+                if wav_path.exists():
+                    file_state[file_info["path"]]["wav_path"] = wav_path
+                raise
             file_state[file_info["path"]]["wav_path"] = wav_path
 
         elif step["name"] == "Whisper Model Setup":
+            if hf_token:
+                # Raises the Hugging Face Hub rate limit for this download;
+                # huggingface_hub picks HF_TOKEN up from the environment
+                # automatically. Setting it here (not globally at process
+                # start) keeps it scoped to jobs that actually opted in.
+                os.environ["HF_TOKEN"] = hf_token
             started = time.perf_counter()
             engine.get_model(model_name, device="cpu")  # loads (or downloads) and caches
             calibration.record_setup_sample(model_name, "cpu", time.perf_counter() - started)
@@ -129,10 +155,18 @@ def _run_single_step(
 
             if execution == "modal":
                 started = time.perf_counter()
-                raw = modal_app.transcribe_on_modal(
-                    audio_path.read_bytes(), model_name, gpu, BEAM_SIZE,
-                    modal_token_id, modal_token_secret,
-                )
+                try:
+                    raw = modal_app.transcribe_on_modal(
+                        audio_path.read_bytes(), model_name, gpu, BEAM_SIZE,
+                        modal_token_id, modal_token_secret,
+                        hf_token=hf_token, should_cancel=should_cancel,
+                    )
+                except StepCancelled:
+                    # Cancelling still bills for GPU time actually used before
+                    # the container was terminated -- credit it rather than
+                    # silently losing track of real Modal spend.
+                    real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
+                    raise
                 # Cost is billed on the *full* RPC wall time (incl. cold
                 # start); calibration uses inference_sec alone so a short
                 # clip's cold-start overhead doesn't skew future
@@ -144,7 +178,7 @@ def _run_single_step(
             else:
                 model = engine.get_model(model_name, device="cpu")  # already loaded by the Setup pass; cheap
                 started = time.perf_counter()
-                segments = engine.transcribe(model, audio_path)
+                segments = engine.transcribe(model, audio_path, should_cancel=should_cancel)
                 if file_duration_sec > 0:
                     calibration.record_rtf_sample(model_name, "cpu", (time.perf_counter() - started) / file_duration_sec)
 
@@ -160,16 +194,23 @@ def _run_single_step(
             if wav_path is not None:
                 wav_path.unlink(missing_ok=True)
 
+    except StepCancelled:
+        who = file_info["path"] if file_info else "job"
+        job.emit({"event": "log", "text": f"Cancelled: {who}"})
+        job.emit({"event": "step_skipped", "step": step["name"]})
+        logger.info("Cancelled during %s%s", step["name"], f" on {who}" if file_info else "")
+        return "cancelled", None, real_cost
+
     except Exception as exc:  # noqa: BLE001 -- surfaced to the user as a log line
         message = _friendly_error(exc)
         who = file_info["path"] if file_info else "job"
         job.emit({"event": "log", "text": f"Failed: {who} — {message}", "fail": True})
         job.emit({"event": "step_failed", "step": step["name"]})
         logger.exception("Failed during %s%s", step["name"], f" on {who}" if file_info else "")
-        return False, message, real_cost
+        return "failed", message, real_cost
 
     job.emit({"event": "step_done", "step": step["name"], "sec": step["sec"]})
-    return True, None, real_cost
+    return "ok", None, real_cost
 
 
 async def run_job(
@@ -183,6 +224,7 @@ async def run_job(
     cleanup: bool,
     modal_token_id: str | None = None,
     modal_token_secret: str | None = None,
+    hf_token: str | None = None,
 ) -> None:
     logger = get_job_logger(job.id)
     logger.info(
@@ -244,19 +286,25 @@ async def run_job(
                 cancelled = True
                 break
 
-            ok, err, cost = await asyncio.to_thread(
+            outcome, err, cost = await asyncio.to_thread(
                 _run_single_step, step, folder, model, formats, execution, gpu,
-                modal_token_id, modal_token_secret, job, logger, file_state,
+                modal_token_id, modal_token_secret, hf_token, job, logger, file_state,
             )
             total_cost += cost
             elapsed_estimated += step["sec"]
             _emit_progress()
 
-            if ok:
+            if outcome == "ok":
                 if file_info is not None:
                     steps_done_for_file[file_info["path"]] += 1
-            elif file_info is not None:
-                failed_files[file_info["path"]] = err
+            elif outcome == "failed":
+                if file_info is not None:
+                    failed_files[file_info["path"]] = err
+            else:  # "cancelled" -- the step noticed the cancel flag and stopped itself mid-flight
+                job.emit({"event": "log", "text": "Cancelled — remaining files/phases were not started."})
+                logger.info("Job %s cancelled mid-step during pass %d", job.id, phase_pass["pass"])
+                cancelled = True
+                break
 
     # Unconditional cleanup pass: runs for every file that actually has a
     # recorded intermediate WAV, regardless of cancellation or failures
@@ -271,16 +319,16 @@ async def run_job(
                 _emit_progress()
                 continue
 
-            ok, err, _cost = await asyncio.to_thread(
+            outcome, err, _cost = await asyncio.to_thread(
                 _run_single_step, step, folder, model, formats, execution, gpu,
-                modal_token_id, modal_token_secret, job, logger, file_state,
+                modal_token_id, modal_token_secret, hf_token, job, logger, file_state,
             )
             elapsed_estimated += step["sec"]
             _emit_progress()
 
-            if ok:
+            if outcome == "ok":
                 steps_done_for_file[file_info["path"]] += 1
-            else:
+            elif outcome == "failed":
                 # Don't overwrite an earlier, more specific failure reason
                 # for this file if it already had one.
                 failed_files.setdefault(file_info["path"], err)
