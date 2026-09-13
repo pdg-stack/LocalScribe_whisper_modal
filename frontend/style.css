@@ -5,12 +5,15 @@
   --text-dim: #6b6b76;
   --border: #e0e0e6;
   --accent: #4f5dff;
+  --accent-rgb: 79, 93, 255;
   --accent-text: #ffffff;
   --danger: #d9453d;
   --greyed: #b8b8c2;
   --success: #1e8e5a;
   --fail: #d9453d;
   --warning: #b8860b;
+  --dropdown-bg: #eef0ff;
+  --dropdown-bg-2: #ffffff;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -21,12 +24,15 @@
     --text-dim: #9a9aa5;
     --border: #34343c;
     --accent: #7b86ff;
+    --accent-rgb: 123, 134, 255;
     --accent-text: #101018;
     --danger: #ff6b63;
     --greyed: #4a4a55;
     --success: #4fce93;
     --fail: #ff6b63;
     --warning: #e0b23d;
+    --dropdown-bg: #2a2a45;
+    --dropdown-bg-2: #1f1f24;
   }
 }
 
@@ -74,13 +80,90 @@ body {
   gap: 8px;
 }
 
-#folder-path {
+.field-label {
+  display: block;
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.sub-label {
+  margin: 0 0 10px;
+}
+
+.folder-input-wrap {
+  position: relative;
   flex: 1;
-  padding: 8px 10px;
+  min-width: 0;
+}
+
+#folder-path {
+  width: 100%;
+  padding: 8px 10px 8px 34px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg);
   color: var(--text);
+}
+
+.icon-btn {
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.icon-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.folder-history-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  /* Both stops are fully opaque -- an alpha-based gradient here previously
+     made the lower part of the dropdown see-through to whatever was
+     behind it. The outline below is the only thing allowed to use
+     transparency, since it renders outside the box, not as its fill. */
+  background: linear-gradient(180deg, var(--dropdown-bg), var(--dropdown-bg-2));
+  border: 1px solid var(--accent);
+  outline: 3px solid rgba(var(--accent-rgb), 0.18);
+  border-radius: 8px;
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.35);
+  z-index: 20;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.folder-history-dropdown[hidden] {
+  display: none;
+}
+
+.folder-history-dropdown li {
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.folder-history-dropdown li:hover {
+  background: rgba(var(--accent-rgb), 0.2);
 }
 
 .btn {
@@ -152,6 +235,14 @@ body {
   text-align: left;
 }
 
+/* Count/Size/Duration are always short, fixed-shape values (formatCount
+   and formatDuration keep them that way even at extreme numbers) -- only
+   the label column (file paths, which can be long) should ever wrap. */
+.scan-table th:not(.col-label),
+.scan-table td:not(.col-label) {
+  white-space: nowrap;
+}
+
 .scope-row .col-label {
   display: flex;
   align-items: center;
@@ -169,6 +260,17 @@ body {
 .file-row td.col-label {
   padding-left: 46px;
   font-weight: 400;
+  /* A long file path wraps inside its own flex item, whose left edge
+     sits right after the checkbox -- so a wrapped second line lines up
+     with where the name started, not back under the checkbox. */
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.file-row td.col-label input[type="checkbox"] {
+  flex: 0 0 auto;
+  margin-top: 2px;
 }
 
 /* Greying applies to text/number color only (label, count, size, duration)
@@ -189,8 +291,32 @@ body {
   color: var(--text-dim);
 }
 
+.row-label-text {
+  cursor: pointer;
+  flex: 1 1 0%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .file-row.hidden-row {
   display: none;
+}
+
+/* Once a job is running, the folder/selection/options steps are frozen --
+   changing any of them mid-job would invalidate the preview the job was
+   actually started from. Still visible (as a reference for what's
+   running), just non-interactive and dimmed. The accordion toggle and
+   the password show/hide eye icon don't change the job's ingredients, so
+   they're explicitly exempted and stay fully usable. */
+.job-locked {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.job-locked .accordion-toggle,
+.job-locked .eye-toggle {
+  pointer-events: auto;
+  opacity: 1;
 }
 
 .summary-line {
@@ -331,6 +457,12 @@ body {
 .phase-icon--done { color: var(--success); }
 .phase-icon--failed { color: var(--fail); }
 .phase-icon--warning { color: var(--warning); }
+
+.step-progress-suffix {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-left: 4px;
+}
 
 @keyframes phase-spin {
   to { transform: rotate(360deg); }

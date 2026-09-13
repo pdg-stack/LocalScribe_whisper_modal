@@ -25,6 +25,11 @@ class PreferencesModel(BaseModel):
     # Never transmitted anywhere but Hugging Face itself, and only ever
     # set as an env var for the process/container doing the download.
     hf_token: str | None = None
+    # Ordered, most-recent-first list of folder paths that have been
+    # successfully analyzed at least once -- powers the folder field's
+    # history dropdown. Appended to by the frontend after a successful
+    # /api/scan, independently of the other fields above.
+    folder_history: list[str] | None = None
 
 
 class FileRef(BaseModel):

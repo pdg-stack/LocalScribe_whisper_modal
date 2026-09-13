@@ -49,7 +49,14 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
-    CALIBRATION_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        CALIBRATION_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        # Best-effort self-tuning data -- a write failure here (disk full,
+        # permissions) must never surface as a failure of the step that
+        # happened to trigger it (Whisper Model Setup / Transcription),
+        # both of which have already done their real work by this point.
+        pass
 
 
 def _get(kind: str, model: str, device: str) -> float | None:

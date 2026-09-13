@@ -28,12 +28,30 @@ function formatBytes(bytes) {
 
 function formatDuration(totalSec) {
   totalSec = Math.round(totalSec);
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
   const s = totalSec % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
+  const totalMinutes = Math.floor(totalSec / 60);
+  const m = totalMinutes % 60;
+  const totalHours = Math.floor(totalMinutes / 60);
+  const h = totalHours % 24;
+  const totalDays = Math.floor(totalHours / 24);
+  const d = totalDays % 365;
+  const y = Math.floor(totalDays / 365);
+
+  // Escalates unit as the value grows so the string always stays short
+  // (two components max) and never needs to wrap in a table cell.
+  if (y > 0) return `${y}y ${d}d`;
+  if (totalDays > 0) return `${totalDays}d ${h}h`;
+  if (totalHours > 0) return `${h}h ${m}m`;
+  if (totalMinutes > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+function formatCount(n) {
+  const units = [{ v: 1e9, s: "B" }, { v: 1e6, s: "M" }, { v: 1e3, s: "K" }];
+  for (const u of units) {
+    if (n >= u.v) return `${(n / u.v).toFixed(1).replace(/\.0$/, "")}${u.s}`;
+  }
+  return `${n}`;
 }
 
 function formatCost(dollars) {
@@ -76,6 +94,10 @@ function selectedFilesInActiveScope() {
   for (const type of ["video", "audio"]) {
     const files = state.scanData.scopes[scope][type].files;
     for (const idx of state.selected[scope][type]) {
+      // -1 is the "select all" sentinel for a group with 0 files (see
+      // renderScanTable) -- it isn't a real file index, so it must never
+      // turn into a phantom selected file here.
+      if (idx < 0) continue;
       result.push({ ...files[idx], type });
     }
   }
@@ -94,29 +116,46 @@ function renderScanTable() {
     const label = scopeKey === "current" ? "Current folder" : "Including subfolders";
     const stats = combinedScopeStats(scopeKey);
 
+    // Level-1 (scope) rows are never greyed -- the radio is always fully
+    // interactive by design (see file header comment), and so is its
+    // label now. Only the type/file rows nested under the inactive scope
+    // stay greyed until its radio is selected.
     const scopeRow = document.createElement("tr");
-    scopeRow.className = "scope-row" + (active ? "" : " greyed");
+    scopeRow.className = "scope-row";
     scopeRow.innerHTML = `
       <td class="col-label">
         <input type="radio" name="scope" value="${scopeKey}" ${active ? "checked" : ""} />
-        ${label}
+        <span class="row-label-text">${label}</span>
       </td>
-      <td>${stats.count}</td>
+      <td>${formatCount(stats.count)}</td>
       <td>${formatBytes(stats.size)}</td>
       <td>${formatDuration(stats.duration)}</td>
     `;
-    scopeRow.querySelector('input[type="radio"]').addEventListener("change", () => {
+    const scopeRadio = scopeRow.querySelector('input[type="radio"]');
+    scopeRadio.addEventListener("change", () => {
       state.scope = scopeKey;
       renderScanTable();
       renderOptionsVisibility();
+    });
+    scopeRow.querySelector(".row-label-text").addEventListener("click", () => {
+      if (scopeRadio.checked) return;
+      scopeRadio.checked = true;
+      scopeRadio.dispatchEvent(new Event("change"));
     });
     scanTableBody.appendChild(scopeRow);
 
     for (const type of ["video", "audio"]) {
       const typeStats = scopeStats(scopeKey, type);
       const selectedSet = state.selected[scopeKey][type];
-      const allSelected = typeStats.count > 0 && selectedSet.size === typeStats.count;
-      const someSelected = selectedSet.size > 0 && !allSelected;
+      // A group with 0 files has nothing for `selectedSet` to ever hold
+      // (there's no index to add), so comparing sizes would either always
+      // be vacuously true or always force this false -- neither lets the
+      // checkbox actually respond to a click. -1 is used as a sentinel
+      // "checked" marker specifically for the empty-group case (safe: it
+      // can only ever be added when this group truly has 0 files, and a
+      // fresh scan always clears selection before file counts can change).
+      const allSelected = typeStats.count > 0 ? selectedSet.size === typeStats.count : selectedSet.has(-1);
+      const someSelected = typeStats.count > 0 && selectedSet.size > 0 && !allSelected;
       const expanded = state.expanded[scopeKey][type];
 
       const typeRow = document.createElement("tr");
@@ -125,9 +164,9 @@ function renderScanTable() {
         <td class="col-label">
           <span class="accordion-toggle">${expanded ? "▾" : "▸"}</span>
           <input type="checkbox" ${allSelected ? "checked" : ""} ${!active ? "disabled" : ""} />
-          ${type === "video" ? "Video" : "Audio"}
+          <span class="row-label-text">${type === "video" ? "Video" : "Audio"}</span>
         </td>
-        <td>${typeStats.count}</td>
+        <td>${formatCount(typeStats.count)}</td>
         <td>${formatBytes(typeStats.size)}</td>
         <td>${formatDuration(typeStats.duration)}</td>
       `;
@@ -142,14 +181,27 @@ function renderScanTable() {
       });
       checkbox.addEventListener("change", () => {
         if (!active) return;
-        const files = state.scanData.scopes[scopeKey][type].files;
-        if (checkbox.checked) {
-          files.forEach((_, i) => selectedSet.add(i));
+        if (typeStats.count === 0) {
+          // Nothing to actually select -- just let the checkbox reflect
+          // the click instead of silently doing nothing.
+          if (checkbox.checked) selectedSet.add(-1); else selectedSet.delete(-1);
         } else {
-          selectedSet.clear();
+          const files = state.scanData.scopes[scopeKey][type].files;
+          if (checkbox.checked) {
+            files.forEach((_, i) => selectedSet.add(i));
+          } else {
+            selectedSet.clear();
+          }
         }
         renderScanTable();
         renderOptionsVisibility();
+      });
+      // Lets the "Video"/"Audio" text itself toggle select-all too -- the
+      // checkbox alone is a small target to have to aim for with a mouse.
+      typeRow.querySelector(".row-label-text").addEventListener("click", () => {
+        if (!active) return;
+        checkbox.checked = !checkbox.checked;
+        checkbox.dispatchEvent(new Event("change"));
       });
       scanTableBody.appendChild(typeRow);
 
@@ -161,17 +213,25 @@ function renderScanTable() {
           fileRow.innerHTML = `
             <td class="col-label">
               <input type="checkbox" ${selectedSet.has(idx) ? "checked" : ""} ${!active ? "disabled" : ""} />
-              ${file.path}
+              <span class="row-label-text">${file.path}</span>
             </td>
             <td></td>
             <td>${formatBytes(file.size_bytes)}</td>
             <td>${formatDuration(file.duration_sec)}</td>
           `;
-          fileRow.querySelector('input[type="checkbox"]').addEventListener("change", (e) => {
+          const fileCheckbox = fileRow.querySelector('input[type="checkbox"]');
+          fileCheckbox.addEventListener("change", (e) => {
             if (!active) return;
             if (e.target.checked) selectedSet.add(idx); else selectedSet.delete(idx);
             renderScanTable();
             renderOptionsVisibility();
+          });
+          // Lets the filename itself toggle its checkbox -- easier to hit
+          // with a mouse than the checkbox alone, especially for long paths.
+          fileRow.querySelector(".row-label-text").addEventListener("click", () => {
+            if (!active) return;
+            fileCheckbox.checked = !fileCheckbox.checked;
+            fileCheckbox.dispatchEvent(new Event("change"));
           });
           scanTableBody.appendChild(fileRow);
         });
@@ -180,8 +240,12 @@ function renderScanTable() {
   }
 
   const sel = selectedFilesInActiveScope();
-  const size = sel.reduce((s, f) => s + f.size_bytes, 0);
-  const duration = sel.reduce((s, f) => s + f.duration_sec, 0);
+  // `|| 0` guards against a stale selection index left over from a
+  // previous folder's (now differently-sized) file list turning into
+  // `undefined` fields -- summing those would otherwise show "NaN"
+  // instead of a real number.
+  const size = sel.reduce((s, f) => s + (f.size_bytes || 0), 0);
+  const duration = sel.reduce((s, f) => s + (f.duration_sec || 0), 0);
   selectionSummary.textContent = sel.length
     ? `Selected: ${sel.length} files — ${formatBytes(size)}, ${formatDuration(duration)}`
     : "Selected: 0 files";
@@ -189,56 +253,23 @@ function renderScanTable() {
 
 // ---------- Folder step ----------
 
+const folderStep = document.getElementById("folder-step");
 const analyzeBtn = document.getElementById("analyze-btn");
 const resetBtn = document.getElementById("reset-btn");
 const folderPathInput = document.getElementById("folder-path");
 const folderStatus = document.getElementById("folder-status");
+const browseFolderBtn = document.getElementById("browse-folder-btn");
+const folderHistoryDropdown = document.getElementById("folder-history-dropdown");
 const selectionStep = document.getElementById("selection-step");
 const optionsStep = document.getElementById("options-step");
 const actionStep = document.getElementById("action-step");
 
-analyzeBtn.addEventListener("click", async () => {
-  const path = folderPathInput.value.trim();
-  if (!path) {
-    folderStatus.textContent = "Enter a folder path first.";
-    folderStatus.className = "status error";
-    folderStatus.hidden = false;
-    return;
-  }
-  folderStatus.textContent = "Scanning…";
-  folderStatus.className = "status";
-  folderStatus.hidden = false;
-  analyzeBtn.disabled = true;
-
-  try {
-    const res = await fetch("/api/scan", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ folder_path: path }),
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.detail || `Scan failed (HTTP ${res.status})`);
-    }
-    state.scanData = await res.json();
-    folderStatus.hidden = true;
-    selectionStep.hidden = false;
-    renderScanTable();
-    await loadPreferences();
-    renderOptionsVisibility();
-  } catch (err) {
-    folderStatus.textContent = err.message || "Could not scan that folder.";
-    folderStatus.className = "status error";
-    folderStatus.hidden = false;
-  } finally {
-    analyzeBtn.disabled = false;
-  }
-});
-
-resetBtn.addEventListener("click", () => {
-  folderPathInput.value = "";
-  folderStatus.hidden = true;
-
+// Everything Reset clears, minus the folder path field and its status
+// message -- shared with a failed Analyze, which needs to clear any
+// stale scan/selection/preview/run state below it (an old successful
+// scan's results shouldn't linger under a now-invalid path) while
+// leaving the path itself and the error message visible.
+function clearDownstreamState() {
   state.scanData = null;
   state.scope = "current";
   state.expanded = { current: { video: false, audio: false }, all: { video: false, audio: false } };
@@ -266,6 +297,159 @@ resetBtn.addEventListener("click", () => {
   previewSelectionSummary.textContent = "";
   invalidatePreview();
   resetRunAndDiagnostics();
+}
+
+// ---------- Folder history (persisted in user_prefs.json's
+// folder_history field -- only folders that have been successfully
+// analyzed at least once get added) ----------
+
+const MAX_FOLDER_HISTORY = 20;
+let folderHistory = [];
+
+// Loaded immediately on page load (not gated on a scan, unlike the rest
+// of loadPreferences() below) so the history dropdown works the moment
+// the page opens, before the user has analyzed anything this session.
+(async () => {
+  try {
+    const res = await fetch("/api/preferences");
+    const prefs = res.ok ? await res.json() : null;
+    if (prefs && Array.isArray(prefs.folder_history)) folderHistory = prefs.folder_history;
+  } catch (e) { /* best effort */ }
+})();
+
+function addToFolderHistory(path) {
+  folderHistory = [path, ...folderHistory.filter((p) => p !== path)].slice(0, MAX_FOLDER_HISTORY);
+  fetch("/api/preferences", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ folder_history: folderHistory }),
+  }).catch(() => { /* best-effort -- a failed save just means history won't persist */ });
+}
+
+function renderFolderHistoryDropdown(matches) {
+  folderHistoryDropdown.innerHTML = "";
+  if (matches.length === 0) {
+    folderHistoryDropdown.hidden = true;
+    return;
+  }
+  matches.forEach((path) => {
+    const li = document.createElement("li");
+    li.textContent = path;
+    // mousedown (not click) fires before the input's blur handler would
+    // otherwise hide the dropdown first and swallow the selection.
+    li.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      folderPathInput.value = path;
+      folderHistoryDropdown.hidden = true;
+      onFolderPathChanged();
+    });
+    folderHistoryDropdown.appendChild(li);
+  });
+  folderHistoryDropdown.hidden = false;
+}
+
+function showFolderHistoryDropdown() {
+  const typed = folderPathInput.value.trim().toLowerCase();
+  const matches = (typed ? folderHistory.filter((p) => p.toLowerCase().includes(typed)) : folderHistory).slice(0, 5);
+  renderFolderHistoryDropdown(matches);
+}
+
+function clearFolderStatus() {
+  folderStatus.hidden = true;
+  folderStatus.textContent = "";
+}
+
+function updateAnalyzeButtonState() {
+  analyzeBtn.disabled = !folderPathInput.value.trim();
+}
+
+// Shared by every way the field's value can change -- typing, picking a
+// history entry, or the native browse dialog -- so a stale validation
+// error never lingers after the path it was about is gone, and Analyze's
+// enabled state always matches whether there's something to analyze.
+function onFolderPathChanged() {
+  clearFolderStatus();
+  updateAnalyzeButtonState();
+}
+
+folderPathInput.addEventListener("focus", showFolderHistoryDropdown);
+folderPathInput.addEventListener("input", () => {
+  onFolderPathChanged();
+  showFolderHistoryDropdown();
+});
+folderPathInput.addEventListener("blur", () => {
+  setTimeout(() => { folderHistoryDropdown.hidden = true; }, 150);
+});
+updateAnalyzeButtonState(); // starts disabled -- the field is empty on page load
+
+browseFolderBtn.addEventListener("click", async () => {
+  browseFolderBtn.disabled = true;
+  try {
+    const res = await fetch("/api/browse-folder", { method: "POST" });
+    if (res.ok) {
+      const body = await res.json();
+      if (body.path) {
+        folderPathInput.value = body.path;
+        folderHistoryDropdown.hidden = true;
+        onFolderPathChanged();
+      }
+    }
+  } catch (e) { /* best effort -- native dialog may not be available */ }
+  finally {
+    browseFolderBtn.disabled = false;
+  }
+});
+
+analyzeBtn.addEventListener("click", async () => {
+  const path = folderPathInput.value.trim();
+  if (!path) return; // the button is disabled in this case, but guard anyway
+  folderStatus.textContent = "Scanning…";
+  folderStatus.className = "status";
+  folderStatus.hidden = false;
+  analyzeBtn.disabled = true;
+
+  try {
+    const res = await fetch("/api/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder_path: path }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `Scan failed (HTTP ${res.status})`);
+    }
+    state.scanData = await res.json();
+    // A fresh scan's file list is a different (or resized) set of files --
+    // any previously selected indices could point at something entirely
+    // different now (or nothing at all), so selection never carries over
+    // from one folder to the next.
+    state.selected = {
+      current: { video: new Set(), audio: new Set() },
+      all: { video: new Set(), audio: new Set() },
+    };
+    folderStatus.hidden = true;
+    selectionStep.hidden = false;
+    renderScanTable();
+    addToFolderHistory(path);
+    await loadPreferences();
+    renderOptionsVisibility();
+  } catch (err) {
+    folderStatus.textContent = err.message || "Could not scan that folder.";
+    folderStatus.className = "status error";
+    folderStatus.hidden = false;
+    // An invalid folder shouldn't leave a previous successful scan's
+    // results (selection, options, preview, run) visible below it.
+    clearDownstreamState();
+  } finally {
+    updateAnalyzeButtonState();
+  }
+});
+
+resetBtn.addEventListener("click", () => {
+  folderPathInput.value = "";
+  folderStatus.hidden = true;
+  updateAnalyzeButtonState();
+  clearDownstreamState();
 });
 
 // ---------- Options step ----------
@@ -293,17 +477,19 @@ GPU_OPTIONS.forEach((gpu) => {
 });
 gpuRecommendation.textContent = `Recommended: ${RECOMMENDED_GPU} — best cost/throughput balance for Whisper inference`;
 
-// Placeholder hardware summary for the Local execution path -- Phase 2+
-// replaces this with a real backend endpoint (e.g. psutil for CPU/RAM,
-// torch.cuda.is_available()/nvidia-smi for GPU) reporting this machine's
-// actual resources.
-const MOCK_LOCAL_RESOURCES = {
-  cpu: "Intel Core i7-12700K — 12 cores / 20 threads",
-  ram: "32 GB RAM",
-  gpu: "NVIDIA GeForce RTX 3080 (10 GB VRAM) — CUDA available",
-};
-localResourceInfo.textContent =
-  `CPU: ${MOCK_LOCAL_RESOURCES.cpu} · RAM: ${MOCK_LOCAL_RESOURCES.ram} · GPU: ${MOCK_LOCAL_RESOURCES.gpu}`;
+// Real hardware summary for the Local execution path, from the machine
+// actually running the server (backend/system_info.py, stdlib-only).
+localResourceInfo.textContent = "Detecting…";
+(async () => {
+  try {
+    const res = await fetch("/api/local-resources");
+    if (!res.ok) throw new Error();
+    const info = await res.json();
+    localResourceInfo.textContent = `CPU: ${info.cpu} · RAM: ${info.ram} · ${info.note}`;
+  } catch (e) {
+    localResourceInfo.textContent = "Could not detect local hardware.";
+  }
+})();
 
 // ---------- Show/hide toggle for Modal token fields (copy/paste/cut are
 // never blocked -- neither <input type=password> nor this toggle does
@@ -324,6 +510,38 @@ document.querySelectorAll(".eye-toggle").forEach((btn) => {
   });
 });
 
+// ---------- Locking the folder/selection/options steps once a job is
+// running -- changing any of them mid-job would invalidate the very
+// preview the running job was started from (and hide Begin/the run
+// panel), so they're frozen (greyed out, all interaction blocked) for
+// the duration of the run. They stay visible so the user can still refer
+// to what the running job was actually configured with. Purely cosmetic
+// controls that can't change the job's ingredients -- the accordion
+// toggle, the password show/hide eye icon -- are explicitly exempted via
+// the .job-locked CSS rule, not disabled here. ----------
+
+function setPreRunSectionsLocked(locked) {
+  [folderStep, selectionStep, optionsStep].forEach((el) => el.classList.toggle("job-locked", locked));
+  const controls = [folderStep, selectionStep, optionsStep]
+    .flatMap((el) => [...el.querySelectorAll("input, select, button")])
+    .filter((el) => !el.classList.contains("eye-toggle"));
+  controls.forEach((el) => { el.disabled = locked; });
+  if (locked) {
+    previewBtn.disabled = true;
+  } else {
+    // Re-derive each control's correct enabled/disabled state (e.g. a
+    // checkbox in the inactive scope, or Analyze with an empty field)
+    // rather than blindly re-enabling everything that was just unlocked.
+    // Deliberately NOT updatePreviewEnabled() -- that also invalidates
+    // (hides) the preview panel/Begin row, which would make the just-
+    // finished job's Steps table disappear the moment it ends; nothing
+    // about the selection/options actually changed here.
+    renderScanTable();
+    updateAnalyzeButtonState();
+    previewBtn.disabled = !computePreviewButtonEnabled();
+  }
+}
+
 function currentExecutionMode() {
   for (const r of executionRadios) if (r.checked) return r.value;
   return "local";
@@ -339,7 +557,7 @@ function renderOptionsVisibility() {
   updatePreviewEnabled();
 }
 
-function updatePreviewEnabled() {
+function computePreviewButtonEnabled() {
   const hasSelection = selectedFilesInActiveScope().length > 0;
   const hasFormat = [...formatChecks.querySelectorAll("input[type=checkbox]")].some((c) => c.checked);
   const mode = currentExecutionMode();
@@ -347,9 +565,17 @@ function updatePreviewEnabled() {
   if (mode === "modal") {
     modalOk = !!gpuSelect.value && tokenIdInput.value.trim() && tokenSecretInput.value.trim();
   }
-  previewBtn.disabled = !(hasSelection && hasFormat && modalOk);
+  return hasSelection && hasFormat && modalOk;
+}
+
+function updatePreviewEnabled() {
+  previewBtn.disabled = !computePreviewButtonEnabled();
   // Any change to selection/options invalidates a preview already shown --
-  // Begin only ever appears right after a fresh Preview run.
+  // Begin only ever appears right after a fresh Preview run. Only called
+  // from places where the selection/options genuinely just changed --
+  // NOT from unlocking after a job ends (see setPreRunSectionsLocked),
+  // where nothing actually changed and the just-finished job's Steps
+  // table should stay visible, not disappear.
   invalidatePreview();
 }
 
@@ -418,6 +644,7 @@ async function loadPreferences() {
   if (prefs.modal_token_id) tokenIdInput.value = prefs.modal_token_id;
   if (prefs.modal_token_secret) tokenSecretInput.value = prefs.modal_token_secret;
   if (prefs.hf_token) hfTokenInput.value = prefs.hf_token;
+  if (Array.isArray(prefs.folder_history)) folderHistory = prefs.folder_history;
   updatePreviewEnabled();
 }
 
@@ -465,11 +692,11 @@ function computeExpectedPhaseCounts(files, execution, cleanup) {
   const bump = (name) => { counts[name] = (counts[name] || 0) + 1; };
   files.forEach((f, i) => {
     if (f.type === "video") bump("Audio Extraction");
-    if (execution !== "modal" && i === 0) bump("Whisper Model Setup");
-    if (execution === "modal") bump("Modal.com Setup & Model Install");
+    if (i === 0) bump(execution === "modal" ? "Modal.com Setup & Model Install" : "Whisper Model Setup");
     bump("Transcription");
     if (execution === "modal") bump("Download Transcript to Local");
-    if (cleanup && f.type === "video") bump("Cleanup");
+    if (i === 0) bump(execution === "modal" ? "Cleanup - Modal.com Teardown" : "Cleanup - Release Whisper Model");
+    if (cleanup && f.type === "video") bump("Cleanup - Intermediate Files");
   });
   return counts;
 }
@@ -481,24 +708,68 @@ function setPhaseIcon(phaseName, state) {
   el.textContent = state === "done" ? "✓" : state === "failed" ? "✗" : state === "warning" ? "!" : "";
 }
 
-// Once every (file, phase) instance for this phase has been accounted for
-// (succeeded, failed, or skipped -- a file already failed in an earlier
-// phase is skipped in this one), finalize its icon: green only if nothing
-// failed, red only if nothing succeeded, yellow for a genuine mix of both
-// (partial success) per the user's "partial completions = yellow warning"
-// requirement. Skips alone (e.g. a phase every file happened to skip)
-// don't count as either success or failure.
-function finalizePhaseIfComplete(phaseName) {
+// Only the Transcription row ever gets a non-empty suffix (see
+// step_progress handling below) -- shows live progress while it runs,
+// clears on a clean finish, but is deliberately left in place if the
+// step was interrupted (failed/skipped/cancelled) so the row keeps
+// showing exactly how far it got.
+function setStepProgressSuffix(phaseName, text) {
+  const el = previewTableBody.querySelector(`.step-progress-suffix[data-phase="${phaseName}"]`);
+  if (el) el.textContent = text;
+}
+
+// Paints a phase's icon from its counts so far -- green only if nothing
+// failed or was cancelled, red if this phase itself was ever interrupted
+// or every file that reached it failed, yellow for a genuine mix of
+// success and failure. cancelledCount always wins over doneCount: a phase
+// where one file succeeded and another was cancelled mid-flight is an
+// interrupted phase, not a successful one, regardless of the mix.
+// skippedCount alone (every file cascade-skipped because an *earlier*
+// phase already failed them -- this phase itself was never attempted)
+// doesn't count as either success or failure.
+function paintPhaseFromCounts(phaseName) {
   const st = phaseStatus[phaseName];
   if (!st) return;
-  const accountedFor = st.doneCount + st.failedCount + st.skippedCount;
-  if (accountedFor < st.expectedCount) return;
-  if (st.failedCount > 0 && st.doneCount > 0) {
+  if (st.cancelledCount > 0) {
+    setPhaseIcon(phaseName, "failed");
+  } else if (st.failedCount > 0 && st.doneCount > 0) {
     setPhaseIcon(phaseName, "warning");
   } else if (st.failedCount > 0) {
     setPhaseIcon(phaseName, "failed");
   } else if (st.doneCount > 0) {
     setPhaseIcon(phaseName, "done");
+  }
+}
+
+// Once every (file, phase) instance for this phase has been accounted for
+// (succeeded, failed, cascade-skipped, or cancelled), paint its final icon.
+function finalizePhaseIfComplete(phaseName) {
+  const st = phaseStatus[phaseName];
+  if (!st) return;
+  const accountedFor = st.doneCount + st.failedCount + st.skippedCount + st.cancelledCount;
+  if (accountedFor < st.expectedCount) return;
+  paintPhaseFromCounts(phaseName);
+}
+
+// The job's "done" event (completed OR cancelled) can arrive while a phase
+// row is still short of its expectedCount -- a cancel stops the pipeline
+// before every file reaches every phase, so no further step_* events for
+// those files are ever coming, and the row is left showing whatever it
+// last was (almost always still spinning) forever without this. A phase
+// with at least one recorded event that's still short of its count was
+// genuinely interrupted partway through -- painted from its counts so
+// far. A phase with *zero* events was never even reached (e.g. Download
+// when Transcription itself got cancelled first) -- left untouched
+// (still its original pending/blank icon) rather than marked failed,
+// since nothing about it actually broke.
+function forceFinalizeIncompletePhases() {
+  for (const name of Object.keys(phaseStatus)) {
+    const st = phaseStatus[name];
+    const accountedFor = st.doneCount + st.failedCount + st.skippedCount + st.cancelledCount;
+    if (accountedFor === 0) continue;
+    if (accountedFor < st.expectedCount) {
+      paintPhaseFromCounts(name);
+    }
   }
 }
 
@@ -532,8 +803,8 @@ previewBtn.addEventListener("click", async () => {
 
   const req = buildTranscribeRequest();
   const selected = selectedFilesInActiveScope();
-  const size = selected.reduce((s, f) => s + f.size_bytes, 0);
-  const duration = selected.reduce((s, f) => s + f.duration_sec, 0);
+  const size = selected.reduce((s, f) => s + (f.size_bytes || 0), 0);
+  const duration = selected.reduce((s, f) => s + (f.duration_sec || 0), 0);
   const modeLabel = req.execution === "modal" ? `Modal.com (${req.gpu})` : "Local";
   previewSelectionSummary.textContent =
     `${req.files.length} files — ${formatBytes(size)}, ${formatDuration(duration)} · ${req.model} model · ${req.formats.join(", ")} · ${modeLabel}`;
@@ -554,7 +825,7 @@ previewBtn.addEventListener("click", async () => {
     previewTableBody.innerHTML = "";
     for (const p of phases) {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td><span class="phase-icon" data-phase="${p.name}"></span>${p.name}</td><td>${formatDuration(p.sec)}</td><td>${formatCost(p.cost)}</td>`;
+      tr.innerHTML = `<td><span class="phase-icon" data-phase="${p.name}"></span>${p.name}<span class="step-progress-suffix" data-phase="${p.name}"></span></td><td>${formatDuration(p.sec)}</td><td>${formatCost(p.cost)}</td>`;
       previewTableBody.appendChild(tr);
     }
     const totalRow = document.createElement("tr");
@@ -576,9 +847,24 @@ function addLogLine(text, isFail) {
   line.textContent = text;
   logBox.appendChild(line);
   logBox.scrollTop = logBox.scrollHeight;
+  return line;
 }
 
+// Audio Extraction and Transcription both report real progress (ffmpeg's
+// -progress stream and faster-whisper's per-segment callback,
+// respectively) -- whichever one is currently running has its log line
+// kept updated in place with a live "(NN%)" suffix as step_progress
+// events arrive, rather than only showing anything once the whole
+// (sometimes long) step completes. Only one step is ever actually
+// running at a time (the pipeline is sequential), so tracking "the"
+// active one by name is enough; cleared whenever that step ends so a
+// late/stray progress event can't rewrite an already-finished line.
+let activeProgressStep = null;
+let activeProgressLine = null;
+let activeProgressBaseText = "";
+
 beginBtn.addEventListener("click", async () => {
+  setPreRunSectionsLocked(true);
   runStep.hidden = false;
   diagnosticsStep.hidden = true;
   logBox.innerHTML = "";
@@ -591,9 +877,13 @@ beginBtn.addEventListener("click", async () => {
   const expected = computeExpectedPhaseCounts(req.files, req.execution, req.cleanup);
   phaseStatus = {};
   for (const [name, expectedCount] of Object.entries(expected)) {
-    phaseStatus[name] = { doneCount: 0, failedCount: 0, skippedCount: 0, expectedCount };
+    phaseStatus[name] = { doneCount: 0, failedCount: 0, skippedCount: 0, cancelledCount: 0, expectedCount };
     setPhaseIcon(name, null); // clear any icon left from a previous run
+    setStepProgressSuffix(name, ""); // clear any "(NN%)" left from a previous run
   }
+  activeProgressStep = null;
+  activeProgressLine = null;
+  activeProgressBaseText = "";
 
   try {
     const res = await fetch("/api/transcribe", {
@@ -613,10 +903,28 @@ beginBtn.addEventListener("click", async () => {
     es.onmessage = (msg) => {
       const event = JSON.parse(msg.data);
       if (event.event === "log") {
-        addLogLine(event.text, !!event.fail);
+        const line = addLogLine(event.text, !!event.fail);
+        activeProgressStep = event.step;
+        activeProgressLine = line;
+        activeProgressBaseText = event.text;
+      } else if (event.event === "step_progress") {
+        // step_progress only ever arrives for Audio Extraction and
+        // Transcription (see pipeline.py), so no name check is needed
+        // here. Two different numbers for two different audiences: the
+        // Steps table has one row per phase for the *whole batch*, so it
+        // shows batch_percent (a continuous 0->100% sweep across every
+        // file in that phase); the scrolling log is file-by-file, so its
+        // line shows percent (this file only, correctly resetting to 0%
+        // per file) -- and only updates if it's still the most recently
+        // logged step (guards against a stray late event after the
+        // pipeline has already moved on).
+        setStepProgressSuffix(event.step, ` (${event.batch_percent}%)`);
+        if (event.step === activeProgressStep && activeProgressLine) {
+          activeProgressLine.textContent = `${activeProgressBaseText} (${event.percent}%)`;
+        }
       } else if (event.event === "step_start") {
         const st = phaseStatus[event.step];
-        if (st && st.doneCount + st.failedCount + st.skippedCount < st.expectedCount) {
+        if (st && st.doneCount + st.failedCount + st.skippedCount + st.cancelledCount < st.expectedCount) {
           setPhaseIcon(event.step, "spinner");
         }
       } else if (event.event === "step_done") {
@@ -625,18 +933,39 @@ beginBtn.addEventListener("click", async () => {
           st.doneCount++;
           finalizePhaseIfComplete(event.step);
         }
+        // A clean finish doesn't need the percent anymore -- only an
+        // interrupted step (failed/cancelled below) keeps it, as a
+        // record of how far it got. Harmless no-op for phases that never
+        // had a suffix to begin with.
+        setStepProgressSuffix(event.step, "");
+        if (event.step === activeProgressStep) activeProgressLine = null;
       } else if (event.event === "step_failed") {
         const st = phaseStatus[event.step];
         if (st) {
           st.failedCount++;
           finalizePhaseIfComplete(event.step);
         }
+        if (event.step === activeProgressStep) activeProgressLine = null;
+      } else if (event.event === "step_cancelled") {
+        // This phase was itself interrupted mid-flight for this file --
+        // distinct from step_skipped below (a file cascade-skipped
+        // because an *earlier* phase already failed it, which says
+        // nothing bad about THIS phase). paintPhaseFromCounts (via
+        // finalizePhaseIfComplete) always shows a phase with any
+        // cancellation as interrupted, never as a clean success.
+        const st = phaseStatus[event.step];
+        if (st) {
+          st.cancelledCount++;
+          finalizePhaseIfComplete(event.step);
+        }
+        if (event.step === activeProgressStep) activeProgressLine = null;
       } else if (event.event === "step_skipped") {
         const st = phaseStatus[event.step];
         if (st) {
           st.skippedCount++;
           finalizePhaseIfComplete(event.step);
         }
+        if (event.step === activeProgressStep) activeProgressLine = null;
       } else if (event.event === "progress") {
         progressBar.value = event.percent;
       } else if (event.event === "done") {
@@ -646,6 +975,8 @@ beginBtn.addEventListener("click", async () => {
         cancelBtn.textContent = "Cancel";
         cancelBtn.disabled = true;
         beginBtn.disabled = false;
+        setPreRunSectionsLocked(false);
+        forceFinalizeIncompletePhases();
         showDiagnostics(event);
       }
     };
@@ -655,12 +986,15 @@ beginBtn.addEventListener("click", async () => {
       activeJobId = null;
       cancelBtn.disabled = true;
       beginBtn.disabled = false;
+      setPreRunSectionsLocked(false);
+      forceFinalizeIncompletePhases();
       addLogLine("Lost connection to the server.", true);
     };
   } catch (err) {
     addLogLine(err.message || "Could not start the job.", true);
     cancelBtn.disabled = true;
     beginBtn.disabled = false;
+    setPreRunSectionsLocked(false);
   }
 });
 

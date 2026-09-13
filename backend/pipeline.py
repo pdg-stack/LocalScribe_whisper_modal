@@ -1,10 +1,11 @@
 """Phase-wise pipeline: every file goes through Audio Extraction together,
-then Whisper Model Setup (local, once), then Transcription (bundling
-Setup+Download per file for Modal, since that's one atomic RPC call),
-then Cleanup -- rather than one file finishing all its phases before the
-next file starts. Runs entirely in a worker thread per step (via
-asyncio.to_thread) so it doesn't block the event loop, and reports
-progress/log events through the job's queue as it goes.
+then Model Setup (once for the whole job -- Whisper Model Setup locally,
+Modal.com Setup & Model Install remotely), then Transcription (+ Download
+per file for Modal, bundled into the same RPC call), then Teardown/Release
+(once for the whole job), then Cleanup -- rather than one file finishing
+all its phases before the next file starts. Runs entirely in a worker
+thread per step (via asyncio.to_thread) so it doesn't block the event
+loop, and reports progress/log events through the job's queue as it goes.
 
 A file that fails one phase is skipped (not retried) in every later
 phase -- it doesn't stop the rest of the job, and its skipped steps still
@@ -19,6 +20,7 @@ import os
 import time
 from collections import Counter
 from pathlib import Path
+from typing import Callable
 
 from backend import calibration
 from backend.config import BEAM_SIZE, GPU_OPTIONS
@@ -53,12 +55,16 @@ def _step_label(step: dict, model: str, execution: str) -> str:
     if name == "Whisper Model Setup":
         return f"Loading {model} model (downloading if not already cached)"
     if name == "Modal.com Setup & Model Install":
-        return f"Setting up Modal.com & installing {model} model: {path}"
+        return f"Setting up Modal.com & installing {model} model (once for the whole job)"
     if name == "Transcription":
         return f"Transcribing ({execution}, {model}): {path}"
     if name == "Download Transcript to Local":
         return f"Downloading transcript: {path}"
-    if name == "Cleanup":
+    if name == "Cleanup - Modal.com Teardown":
+        return "Tearing down the Modal.com container"
+    if name == "Cleanup - Release Whisper Model":
+        return "Releasing the Whisper model from memory"
+    if name == "Cleanup - Intermediate Files":
         return f"Cleaning up intermediate audio: {path}"
     return f"{name}: {path}"
 
@@ -91,12 +97,12 @@ def _run_single_step(
     formats: list[str],
     execution: str,
     gpu: str | None,
-    modal_token_id: str | None,
-    modal_token_secret: str | None,
+    modal_transcriber: modal_app.ModalTranscriber | None,
     hf_token: str | None,
     job: Job,
     logger: logging.Logger,
     file_state: dict,
+    progress_cb: Callable[[float], None] | None = None,
 ) -> tuple[str, str | None, float]:
     """Runs exactly one step (one file's one phase, or a job-level step
     when step["file"] is None) synchronously in a worker thread. Returns
@@ -110,8 +116,18 @@ def _run_single_step(
     to run to completion."""
     file_info = step["file"]
     label = _step_label(step, model_name, execution)
-    job.emit({"event": "log", "text": label})
+    job.emit({"event": "log", "text": label, "step": step["name"]})
     job.emit({"event": "step_start", "step": step["name"]})
+    if progress_cb is not None and step["name"] in ("Audio Extraction", "Transcription"):
+        # Shows "(0%)" the instant the step starts, for both local and
+        # Modal execution, instead of leaving the suffix blank until the
+        # first real segment/progress event arrives -- which, for Modal
+        # specifically, can be a few seconds into the RPC (reading the
+        # WAV off disk, uploading it, the remote call actually starting)
+        # after the spinner already appeared. A bare spinner with no
+        # number reads as "is this stuck?"; explicit 0% reads as "yes,
+        # this really did just start."
+        progress_cb(0.0)
     logger.info(label)
     real_cost = 0.0
 
@@ -122,8 +138,14 @@ def _run_single_step(
         if step["name"] == "Audio Extraction":
             abs_path = folder_path / file_info["path"]
             wav_path = abs_path.with_suffix(".wav")
+            file_duration_sec = file_info["duration_sec"]
+
+            def on_extraction_progress(processed_sec: float) -> None:
+                if progress_cb is not None and file_duration_sec > 0:
+                    progress_cb(min(1.0, processed_sec / file_duration_sec))
+
             try:
-                extract_audio(abs_path, wav_path, should_cancel=should_cancel)
+                extract_audio(abs_path, wav_path, should_cancel=should_cancel, on_progress=on_extraction_progress)
             except StepCancelled:
                 # ffmpeg may have already written a partial file before
                 # being killed -- record it so the unconditional Cleanup
@@ -141,11 +163,29 @@ def _run_single_step(
                 # start) keeps it scoped to jobs that actually opted in.
                 os.environ["HF_TOKEN"] = hf_token
             started = time.perf_counter()
-            engine.get_model(model_name, device="cpu")  # loads (or downloads) and caches
+            # acquire_model (not get_model) pins this model against the
+            # matching release_model() in "Cleanup - Release Whisper
+            # Model" below, so a concurrent second job using the same
+            # model can't have this job's cleanup evict it first.
+            engine.acquire_model(model_name, device="cpu")  # loads (or downloads) and caches
             calibration.record_setup_sample(model_name, "cpu", time.perf_counter() - started)
 
         elif step["name"] == "Modal.com Setup & Model Install":
-            pass  # bundled into the Transcription step below (one atomic Modal RPC)
+            # A real, billable Modal call (container cold start + model
+            # load) -- timed and credited the same way Transcription's
+            # RPC time is, so the job's real total_cost isn't missing the
+            # GPU-seconds this step actually spent (Preview already
+            # estimates a non-zero cost for it via MODAL_SETUP_SEC).
+            started = time.perf_counter()
+            try:
+                modal_transcriber.warm_up(should_cancel=should_cancel)
+            except StepCancelled:
+                # Cancelling still bills for GPU time actually used before
+                # the container was terminated -- same reasoning as the
+                # Transcription branch below.
+                real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
+                raise
+            real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
 
         elif step["name"] == "Transcription":
             abs_path = folder_path / file_info["path"]
@@ -153,13 +193,21 @@ def _run_single_step(
             audio_path = wav_path if wav_path is not None else abs_path
             file_duration_sec = file_info["duration_sec"]
 
+            def on_segment_end(end_sec: float) -> None:
+                # Reports how far into the file transcription has reached
+                # so far, as a 0..1 fraction -- this is what makes the "(NN%)"
+                # label and the progress bar move *during* Transcription
+                # instead of only jumping once the whole file is done, which
+                # matters most here since it's normally the longest step.
+                if progress_cb is not None and file_duration_sec > 0:
+                    progress_cb(min(1.0, end_sec / file_duration_sec))
+
             if execution == "modal":
                 started = time.perf_counter()
                 try:
-                    raw = modal_app.transcribe_on_modal(
-                        audio_path.read_bytes(), model_name, gpu, BEAM_SIZE,
-                        modal_token_id, modal_token_secret,
-                        hf_token=hf_token, should_cancel=should_cancel,
+                    raw = modal_transcriber.transcribe(
+                        audio_path.read_bytes(), BEAM_SIZE,
+                        should_cancel=should_cancel, on_progress=on_segment_end,
                     )
                 except StepCancelled:
                     # Cancelling still bills for GPU time actually used before
@@ -178,7 +226,7 @@ def _run_single_step(
             else:
                 model = engine.get_model(model_name, device="cpu")  # already loaded by the Setup pass; cheap
                 started = time.perf_counter()
-                segments = engine.transcribe(model, audio_path, should_cancel=should_cancel)
+                segments = engine.transcribe(model, audio_path, should_cancel=should_cancel, on_progress=on_segment_end)
                 if file_duration_sec > 0:
                     calibration.record_rtf_sample(model_name, "cpu", (time.perf_counter() - started) / file_duration_sec)
 
@@ -189,7 +237,17 @@ def _run_single_step(
         elif step["name"] == "Download Transcript to Local":
             pass  # already covered by the Transcription step's bundled RPC
 
-        elif step["name"] == "Cleanup":
+        elif step["name"] == "Cleanup - Modal.com Teardown":
+            # Explicit, visible teardown of the job's warm container/session
+            # -- a failure here is caught by the except Exception block
+            # below like any other step (logged, shown as a failed phase)
+            # without stopping the job from continuing on to file cleanup.
+            modal_transcriber.__exit__(None, None, None)
+
+        elif step["name"] == "Cleanup - Release Whisper Model":
+            engine.release_model(model_name, device="cpu")
+
+        elif step["name"] == "Cleanup - Intermediate Files":
             wav_path = file_state[file_info["path"]].get("wav_path")
             if wav_path is not None:
                 wav_path.unlink(missing_ok=True)
@@ -197,7 +255,14 @@ def _run_single_step(
     except StepCancelled:
         who = file_info["path"] if file_info else "job"
         job.emit({"event": "log", "text": f"Cancelled: {who}"})
-        job.emit({"event": "step_skipped", "step": step["name"]})
+        # Distinct from step_skipped (below and in run_job's main loop),
+        # which means "an earlier phase already failed this file, so this
+        # phase was never even attempted for it" -- harmless, doesn't
+        # reflect on THIS phase. step_cancelled means this phase itself
+        # was genuinely interrupted mid-flight -- the frontend needs that
+        # distinction so a phase where one file succeeded and another was
+        # cancelled shows as interrupted, not as a clean success.
+        job.emit({"event": "step_cancelled", "step": step["name"]})
         logger.info("Cancelled during %s%s", step["name"], f" on {who}" if file_info else "")
         return "cancelled", None, real_cost
 
@@ -241,8 +306,8 @@ async def run_job(
     # job was cancelled before reaching Cleanup normally. The point of
     # opting into cleanup is not leaving stray files behind; that
     # shouldn't depend on the rest of the job finishing cleanly.
-    main_passes = [p for p in passes if p["steps"][0]["name"] != "Cleanup"]
-    cleanup_pass = next((p for p in passes if p["steps"][0]["name"] == "Cleanup"), None)
+    main_passes = [p for p in passes if p["steps"][0]["name"] != "Cleanup - Intermediate Files"]
+    cleanup_pass = next((p for p in passes if p["steps"][0]["name"] == "Cleanup - Intermediate Files"), None)
     folder = Path(folder_path)
 
     file_state: dict[str, dict] = {f["path"]: {} for f in files}
@@ -255,83 +320,206 @@ async def run_job(
     started_at = time.perf_counter()
     cancelled = False
 
+    # Audio Extraction and Transcription both report real per-file
+    # progress. Two different audiences want two different numbers out of
+    # that: the scrolling log line is about *this file*, so it correctly
+    # resets to 0% at the start of each new file -- but the Steps table
+    # has one row per phase for the *whole batch*, so its "(NN%)" should
+    # read as one continuous 0->100% sweep across every file in that
+    # phase, not repeatedly reset. batch_progress_done tracks how many
+    # seconds of audio have already been fully accounted for in each
+    # phase (advanced in the main loop below); batch_progress_total is
+    # the fixed denominator for each (only video files go through Audio
+    # Extraction; every file goes through Transcription).
+    batch_progress_total = {
+        "Audio Extraction": sum(f["duration_sec"] for f in files if f["type"] == "video") or 1.0,
+        "Transcription": sum(f["duration_sec"] for f in files) or 1.0,
+    }
+    batch_progress_done = {name: 0.0 for name in batch_progress_total}
+
     def _emit_progress() -> None:
         job.emit({"event": "progress", "percent": min(100, round(elapsed_estimated / total_estimated_sec * 100))})
 
-    for phase_pass in main_passes:
-        if cancelled:
-            break
-        if job.cancel_requested:
-            job.emit({"event": "log", "text": "Cancelled — remaining phases were not started."})
-            logger.info("Job %s cancelled before pass %d", job.id, phase_pass["pass"])
-            cancelled = True
-            break
+    def _make_progress_cb(step: dict) -> Callable[[float], None]:
+        # Turns a 0..1 fraction of *this step's* estimated duration into a
+        # finer-grained overall progress-bar update (instead of the bar
+        # only moving once the whole, often very long, step completes).
+        # Also emits two different percentages for display: `percent`
+        # (this file only, for the log line) and `batch_percent` (blended
+        # across the whole batch, for the Steps-table row). Throttled so
+        # a fast model's segment-per-fraction-of-a-second callback rate
+        # doesn't flood the SSE stream.
+        last = {"t": 0.0, "pct": -1}
 
-        for step in phase_pass["steps"]:
-            file_info = step["file"]
+        def cb(fraction: float) -> None:
+            now = time.perf_counter()
+            pct = round(max(0.0, min(1.0, fraction)) * 100)
+            if pct == last["pct"] or now - last["t"] < 0.5:
+                return
+            last["t"], last["pct"] = now, pct
 
-            # A file that already failed an earlier phase is skipped in
-            # every later phase -- still counted toward progress so the
-            # bar reaches 100%, and toward the frontend's phase-icon
-            # accounting via step_skipped, but never retried.
-            if file_info is not None and file_info["path"] in failed_files:
-                job.emit({"event": "step_skipped", "step": step["name"]})
-                elapsed_estimated += step["sec"]
-                _emit_progress()
-                continue
+            batch_pct = pct
+            if step["name"] in batch_progress_total and step["file"] is not None:
+                done = batch_progress_done[step["name"]]
+                total = batch_progress_total[step["name"]]
+                blended = (done + fraction * step["file"]["duration_sec"]) / total
+                batch_pct = round(min(1.0, blended) * 100)
 
+            job.emit({"event": "step_progress", "step": step["name"], "percent": pct, "batch_percent": batch_pct})
+            partial = elapsed_estimated + step["sec"] * (pct / 100)
+            job.emit({"event": "progress", "percent": min(100, round(partial / total_estimated_sec * 100))})
+
+        return cb
+
+    # One Modal App/container is opened for the *whole job*, not per file --
+    # every file's Transcription step below reuses the same warm container
+    # and already-loaded model via modal_transcriber.transcribe(), instead
+    # of each file cold-starting its own ephemeral Modal session.
+    modal_transcriber = None
+    if execution == "modal":
+        modal_transcriber = modal_app.ModalTranscriber(gpu, model, modal_token_id, modal_token_secret, hf_token)
+        await asyncio.to_thread(modal_transcriber.__enter__)
+
+    # Mirrors modal_transcriber's is_active-guarded safety net below, for
+    # local execution: if the job is cancelled before its explicit
+    # "Cleanup - Release Whisper Model" step gets a chance to run (e.g.
+    # cancelled mid-Transcription), the model acquired in "Whisper Model
+    # Setup" would otherwise never be released at all -- unlike Modal,
+    # local has no single always-runs finally block already doing this,
+    # so it's tracked explicitly instead.
+    local_model_acquired = False
+    local_model_released = False
+
+    try:
+        for phase_pass in main_passes:
+            if cancelled:
+                break
             if job.cancel_requested:
-                job.emit({"event": "log", "text": "Cancelled — remaining files/phases were not started."})
-                logger.info("Job %s cancelled mid-pass %d", job.id, phase_pass["pass"])
+                job.emit({"event": "log", "text": "Cancelled — remaining phases were not started."})
+                logger.info("Job %s cancelled before pass %d", job.id, phase_pass["pass"])
                 cancelled = True
                 break
 
-            outcome, err, cost = await asyncio.to_thread(
-                _run_single_step, step, folder, model, formats, execution, gpu,
-                modal_token_id, modal_token_secret, hf_token, job, logger, file_state,
-            )
-            total_cost += cost
-            elapsed_estimated += step["sec"]
-            _emit_progress()
+            for step in phase_pass["steps"]:
+                file_info = step["file"]
 
-            if outcome == "ok":
-                if file_info is not None:
-                    steps_done_for_file[file_info["path"]] += 1
-            elif outcome == "failed":
-                if file_info is not None:
-                    failed_files[file_info["path"]] = err
-            else:  # "cancelled" -- the step noticed the cancel flag and stopped itself mid-flight
-                job.emit({"event": "log", "text": "Cancelled — remaining files/phases were not started."})
-                logger.info("Job %s cancelled mid-step during pass %d", job.id, phase_pass["pass"])
-                cancelled = True
-                break
+                # A file that already failed an earlier phase is skipped in
+                # every later phase -- still counted toward progress so the
+                # bar reaches 100%, and toward the frontend's phase-icon
+                # accounting via step_skipped, but never retried.
+                if file_info is not None and file_info["path"] in failed_files:
+                    job.emit({"event": "step_skipped", "step": step["name"]})
+                    elapsed_estimated += step["sec"]
+                    if step["name"] in batch_progress_done:
+                        batch_progress_done[step["name"]] += file_info["duration_sec"]
+                    _emit_progress()
+                    continue
 
-    # Unconditional cleanup pass: runs for every file that actually has a
-    # recorded intermediate WAV, regardless of cancellation or failures
-    # in later phases. A file with no WAV on record (extraction never
-    # ran/succeeded, or it wasn't a video file) has nothing to clean up.
-    if cleanup_pass is not None:
-        for step in cleanup_pass["steps"]:
-            file_info = step["file"]
-            if file_state.get(file_info["path"], {}).get("wav_path") is None:
-                job.emit({"event": "step_skipped", "step": step["name"]})
+                if job.cancel_requested:
+                    job.emit({"event": "log", "text": "Cancelled — remaining files/phases were not started."})
+                    logger.info("Job %s cancelled mid-pass %d", job.id, phase_pass["pass"])
+                    cancelled = True
+                    break
+
+                outcome, err, cost = await asyncio.to_thread(
+                    _run_single_step, step, folder, model, formats, execution, gpu,
+                    modal_transcriber, hf_token, job, logger, file_state,
+                    _make_progress_cb(step),
+                )
+                total_cost += cost
+                elapsed_estimated += step["sec"]
+                if step["name"] in batch_progress_done and file_info is not None and outcome != "cancelled":
+                    # Counts toward the blended batch-wide percent above
+                    # whether this file's step succeeded or failed --
+                    # either way the pipeline is past it, so it should no
+                    # longer hold back the batch-wide percentage.
+                    batch_progress_done[step["name"]] += file_info["duration_sec"]
+                _emit_progress()
+
+                if step["name"] == "Whisper Model Setup" and outcome == "ok":
+                    local_model_acquired = True
+                if step["name"] == "Cleanup - Release Whisper Model":
+                    local_model_released = True
+
+                if outcome == "ok":
+                    if file_info is not None:
+                        steps_done_for_file[file_info["path"]] += 1
+                elif outcome == "failed":
+                    if file_info is not None:
+                        failed_files[file_info["path"]] = err
+                else:  # "cancelled" -- the step noticed the cancel flag and stopped itself mid-flight
+                    job.emit({"event": "log", "text": "Cancelled — remaining files/phases were not started."})
+                    logger.info("Job %s cancelled mid-step during pass %d", job.id, phase_pass["pass"])
+                    cancelled = True
+                    break
+
+        # Unconditional cleanup pass: runs for every file that actually has a
+        # recorded intermediate WAV, regardless of cancellation or failures
+        # in later phases. A file with no WAV on record (extraction never
+        # ran/succeeded, or it wasn't a video file) has nothing to clean up.
+        if cleanup_pass is not None:
+            for step in cleanup_pass["steps"]:
+                file_info = step["file"]
+                if file_state.get(file_info["path"], {}).get("wav_path") is None:
+                    job.emit({"event": "step_skipped", "step": step["name"]})
+                    elapsed_estimated += step["sec"]
+                    _emit_progress()
+                    continue
+
+                outcome, err, _cost = await asyncio.to_thread(
+                    _run_single_step, step, folder, model, formats, execution, gpu,
+                    modal_transcriber, hf_token, job, logger, file_state,
+                )
                 elapsed_estimated += step["sec"]
                 _emit_progress()
-                continue
 
-            outcome, err, _cost = await asyncio.to_thread(
-                _run_single_step, step, folder, model, formats, execution, gpu,
-                modal_token_id, modal_token_secret, hf_token, job, logger, file_state,
-            )
-            elapsed_estimated += step["sec"]
-            _emit_progress()
+                if outcome == "ok":
+                    steps_done_for_file[file_info["path"]] += 1
+                elif outcome == "failed":
+                    # Don't overwrite an earlier, more specific failure reason
+                    # for this file if it already had one.
+                    failed_files.setdefault(file_info["path"], err)
+    finally:
+        if modal_transcriber is not None:
+            # Only emit events if this is genuinely the one doing the
+            # teardown work -- if the job reached its own explicit
+            # "Cleanup - Modal.com Teardown" step normally, __exit__() is
+            # already idempotent and this call is a real no-op, so it
+            # must not also emit a second, redundant step_start/step_done
+            # for that phase. But when the job is cancelled *before*
+            # reaching that step, this silent safety net is the only
+            # thing that actually tears the container down -- without
+            # emitting its own events here, the frontend has no way to
+            # know that happened and (via forceFinalizeIncompletePhases)
+            # would show it as failed even though it just succeeded.
+            was_active = modal_transcriber.is_active
+            if was_active:
+                job.emit({"event": "step_start", "step": "Cleanup - Modal.com Teardown"})
+            try:
+                await asyncio.to_thread(modal_transcriber.__exit__, None, None, None)
+            except Exception as exc:  # noqa: BLE001 -- best-effort cleanup, never re-raised
+                logger.exception("Job %s: Modal.com teardown failed during cleanup", job.id)
+                if was_active:
+                    job.emit({"event": "log", "text": f"Modal.com teardown failed: {_friendly_error(exc)}", "fail": True})
+                    job.emit({"event": "step_failed", "step": "Cleanup - Modal.com Teardown"})
+            else:
+                if was_active:
+                    job.emit({"event": "step_done", "step": "Cleanup - Modal.com Teardown", "sec": 0.0})
 
-            if outcome == "ok":
-                steps_done_for_file[file_info["path"]] += 1
-            elif outcome == "failed":
-                # Don't overwrite an earlier, more specific failure reason
-                # for this file if it already had one.
-                failed_files.setdefault(file_info["path"], err)
+        # Same safety net as above, for local execution: only needed if
+        # this job's Setup actually acquired the model (nothing to
+        # release otherwise) and its own explicit "Cleanup - Release
+        # Whisper Model" step never got a chance to run.
+        if execution != "modal" and local_model_acquired and not local_model_released:
+            job.emit({"event": "step_start", "step": "Cleanup - Release Whisper Model"})
+            try:
+                await asyncio.to_thread(engine.release_model, model, "cpu")
+            except Exception as exc:  # noqa: BLE001 -- best-effort cleanup, never re-raised
+                logger.exception("Job %s: releasing the Whisper model failed during cleanup", job.id)
+                job.emit({"event": "log", "text": f"Releasing the Whisper model failed: {_friendly_error(exc)}", "fail": True})
+                job.emit({"event": "step_failed", "step": "Cleanup - Release Whisper Model"})
+            else:
+                job.emit({"event": "step_done", "step": "Cleanup - Release Whisper Model", "sec": 0.0})
 
     total_sec = time.perf_counter() - started_at
     succeeded = sum(
@@ -361,3 +549,34 @@ async def run_job(
         "per_minute_sec": total_sec / total_minutes,
         "per_minute_cost": total_cost / total_minutes,
     })
+
+
+async def run_job_safe(job: Job, *args, **kwargs) -> None:
+    """Wraps run_job with a last-resort guard for bugs in the pipeline
+    itself (as opposed to a single file/step failing, which run_job
+    already handles and reports per-file without this). Without this, a
+    crash before the first "done" event (e.g. building the Modal
+    App/Cls, or any other setup that runs before the per-step try/except
+    blocks) leaves the job's SSE stream open with nothing more ever
+    arriving -- the frontend just sits there spinning forever with no
+    indication anything went wrong. This ensures the job always ends
+    with a "done" event and a clear log line, however it fails."""
+    try:
+        await run_job(job, *args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+        logger = get_job_logger(job.id)
+        logger.exception("Job %s crashed unexpectedly", job.id)
+        job.emit({"event": "log", "text": f"Job failed unexpectedly: {_friendly_error(exc)}", "fail": True})
+        job.emit({
+            "event": "done",
+            "succeeded": 0,
+            "failed": 0,
+            "skipped": 0,
+            "cancelled": False,
+            "total_sec": 0.0,
+            "total_cost": 0.0,
+            "per_file_sec": 0.0,
+            "per_file_cost": 0.0,
+            "per_minute_sec": 0.0,
+            "per_minute_cost": 0.0,
+        })

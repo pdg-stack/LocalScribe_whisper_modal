@@ -18,13 +18,20 @@ from backend.config import (
     RTF_MODAL_GPU,
 )
 
-PHASE_ORDER_LOCAL = ["Audio Extraction", "Whisper Model Setup", "Transcription", "Cleanup"]
+PHASE_ORDER_LOCAL = [
+    "Audio Extraction",
+    "Whisper Model Setup",
+    "Transcription",
+    "Cleanup - Release Whisper Model",
+    "Cleanup - Intermediate Files",
+]
 PHASE_ORDER_MODAL = [
     "Audio Extraction",
     "Modal.com Setup & Model Install",
     "Transcription",
     "Download Transcript to Local",
-    "Cleanup",
+    "Cleanup - Modal.com Teardown",
+    "Cleanup - Intermediate Files",
 ]
 
 
@@ -83,36 +90,64 @@ def compute_steps(
         if f["type"] == "video":
             steps.append({"file": f, "name": "Audio Extraction", "pass": 0, "sec": (f["duration_sec"] / 60) * 2, "cost": 0.0})
 
-    # Pass 1 (local only): Whisper Model Setup -- once for the whole job,
-    # not per file (the model loads once and is reused). Modal has no
-    # equivalent standalone pass: its setup is genuinely per-file (see
-    # pass 2 below), since each call spins up a fresh ephemeral container.
-    if not is_modal:
+    # Pass 1: Model Setup -- once for the whole job, not per file. Local
+    # loads the model into this process and reuses it for every file
+    # (engine.py caches it); Modal now keeps one warm container + one
+    # already-loaded model for the whole job too (see modal_app.py's
+    # ModalTranscriber), so its cold start is likewise a single job-level
+    # cost rather than something every file pays again.
+    if is_modal:
+        steps.append({
+            "file": None, "name": "Modal.com Setup & Model Install", "pass": 1,
+            "sec": MODAL_SETUP_SEC, "cost": (MODAL_SETUP_SEC / 3600) * rate,
+        })
+    else:
         steps.append({"file": None, "name": "Whisper Model Setup", "pass": 1, "sec": _estimate_local_setup_sec(model), "cost": 0.0})
 
-    # Pass 2: Transcription. For Modal this bundles Setup+Transcribe+
-    # Download into one RPC call per file (can't be split further -- see
-    # modal_app.py) -- still shown as 3 rows, but they execute together,
-    # file by file, within this one pass.
+    # Pass 2: Transcription for every file -- kept as one contiguous pass
+    # (even for Modal, where the download already happens as part of the
+    # same RPC call as transcription -- see modal_app.py's transcribe())
+    # so every file's Transcription genuinely finishes, in the real
+    # execution order, before any file's Download phase starts. When they
+    # were interleaved per file, the two showed as running at once with
+    # nothing to explain why.
     for f in files:
-        if is_modal:
-            steps.append({
-                "file": f, "name": "Modal.com Setup & Model Install", "pass": 2,
-                "sec": MODAL_SETUP_SEC, "cost": (MODAL_SETUP_SEC / 3600) * rate,
-            })
         transcription_sec = f["duration_sec"] * rtf
         steps.append({
             "file": f, "name": "Transcription", "pass": 2,
             "sec": transcription_sec, "cost": (transcription_sec / 3600) * rate if is_modal else 0.0,
         })
-        if is_modal:
-            steps.append({"file": f, "name": "Download Transcript to Local", "pass": 2, "sec": MODAL_DOWNLOAD_SEC, "cost": 0.0})
 
-    # Pass 3: Cleanup -- every video file, once all transcriptions are done.
+    next_pass = 3
+    # Pass 3 (Modal only): Download Transcript to Local -- a formality by
+    # this point (the transcript is already written to disk as part of
+    # Transcription above); kept as its own pass purely for the time/cost
+    # line item, and so it's only ever shown starting once every file's
+    # Transcription has actually finished.
+    if is_modal:
+        for f in files:
+            steps.append({"file": f, "name": "Download Transcript to Local", "pass": next_pass, "sec": MODAL_DOWNLOAD_SEC, "cost": 0.0})
+        next_pass += 1
+
+    # Pass N: Release Resources -- always runs, unlike the Cleanup pass
+    # below, since it's not a user preference but releasing something
+    # that's actively costing money (Modal) or holding memory (local).
+    # Runs once the whole job is done and before file Cleanup, so a
+    # container/model teardown failure can't leave WAVs undeleted behind
+    # it -- pipeline.py catches and logs a teardown failure without
+    # stopping the job from reaching Cleanup.
+    if is_modal:
+        steps.append({"file": None, "name": "Cleanup - Modal.com Teardown", "pass": next_pass, "sec": 2.0, "cost": 0.0})
+    else:
+        steps.append({"file": None, "name": "Cleanup - Release Whisper Model", "pass": next_pass, "sec": 1.0, "cost": 0.0})
+    next_pass += 1
+
+    # Pass N+1: delete the intermediate WAVs -- every video file, once all
+    # transcriptions are done.
     if cleanup:
         for f in files:
             if f["type"] == "video":
-                steps.append({"file": f, "name": "Cleanup", "pass": 3, "sec": 1.0, "cost": 0.0})
+                steps.append({"file": f, "name": "Cleanup - Intermediate Files", "pass": next_pass, "sec": 1.0, "cost": 0.0})
 
     return steps
 
@@ -126,5 +161,5 @@ def aggregate_phases(steps: list[dict], execution: str, cleanup: bool) -> list[d
     return [
         {"name": name, "sec": totals[name]["sec"], "cost": totals[name]["cost"]}
         for name in order
-        if name != "Cleanup" or cleanup
+        if name != "Cleanup - Intermediate Files" or cleanup
     ]
