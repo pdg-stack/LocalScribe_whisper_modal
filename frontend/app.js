@@ -693,6 +693,7 @@ function computeExpectedPhaseCounts(files, execution, cleanup) {
   files.forEach((f, i) => {
     if (f.type === "video") bump("Audio Extraction");
     if (i === 0) bump(execution === "modal" ? "Modal.com Setup & Model Install" : "Whisper Model Setup");
+    if (execution === "modal") bump("Upload audio files to Modal.com");
     bump("Transcription");
     if (execution === "modal") bump("Download Transcript to Local");
     if (i === 0) bump(execution === "modal" ? "Cleanup - Modal.com Teardown" : "Cleanup - Release Whisper Model");

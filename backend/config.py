@@ -52,6 +52,32 @@ GPU_SPEED_MULTIPLIER = {
 MODAL_SETUP_SEC = 20  # cold start: spin instance + install/load model
 MODAL_DOWNLOAD_SEC = 2  # transcript result back to local
 
+# The extracted WAV's fixed bitrate (16kHz, mono, 16-bit -- matches
+# ffmpeg_utils.extract_audio's output format exactly), used to estimate
+# how many bytes a file's "Upload audio files to Modal.com" step will
+# need to send.
+WAV_BYTES_PER_SEC = 32_000
+
+# Conservative assumed upload bandwidth (~8 Mbps) for estimating how long
+# uploading that WAV will take -- real speed varies enormously by
+# connection, so this is only the fallback used before any real samples
+# exist; backend/calibration.py prefers actually-measured throughput from
+# completed jobs once available, same self-correcting mechanism as the
+# RTF/setup tables above.
+MODAL_UPLOAD_BYTES_PER_SEC = 1_000_000
+
+# Modal's own per-container ephemeral disk quota defaults to 512 GiB
+# (confirmed via Modal's docs: "a per-container disk quota that defaults
+# to 512 GiB", raisable up to 3 TiB via the `ephemeral_disk` Function
+# parameter). Every file in a job uploads to that same shared container's
+# /tmp *before* any of them are transcribed and deleted (Upload is its
+# own pass, ahead of Transcription -- see estimator.py/pipeline.py), so
+# the true peak usage is the *whole batch's* total size, not any single
+# file's. 500 GB (decimal, not GiB -- deliberately the more conservative
+# of the two units) leaves a real margin below the 512 GiB default quota
+# rather than cutting it close.
+MAX_MODAL_UPLOAD_BYTES = 500 * 1_000_000_000
+
 # Rough estimate assuming the model is already cached locally (fast path).
 # A genuine first-time download depends entirely on the user's internet
 # speed and model size, so this is a starting point only -- real observed

@@ -41,12 +41,46 @@ IMAGE = (
 MODEL_CACHE_DIR = "/cache/huggingface"
 MODEL_CACHE_VOLUME = modal.Volume.from_name("localscribe-whisper-model-cache", create_if_missing=True)
 
+# Uploading the whole WAV as a single function argument (the old design)
+# is one blocking network call with no visibility into progress and no
+# way to check should_cancel() until it's fully done -- for a long file
+# that can be 60-200+ seconds with the UI unable to tell "uploading" from
+# "hung" (and for anything over Modal's ~100MB per-call gRPC payload
+# limit, it fails outright). Chunking it into many small RPCs instead
+# gives should_cancel() a check between every chunk and a real progress
+# callback after each one.
+#
+# 16 MB is a deliberate middle ground, not a measured optimum: a bigger
+# chunk means fewer RPC round-trips (less fixed per-call overhead) but
+# worse cancel/progress granularity, since a chunk already in flight
+# can't be interrupted. At the conservative ~1MB/s assumed upload
+# bandwidth (see config.MODAL_UPLOAD_BYTES_PER_SEC), 16MB keeps
+# worst-case cancel latency around 16s while cutting a 200MB file's
+# chunk count ~4x versus a smaller 4MB chunk (50 calls -> ~13) -- and
+# still leaves a healthy ~6x margin under the 100MB hard limit.
+UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024
+
 
 def _build_transcriber_cls(model_name: str):
     # Built dynamically (per job) so model_name can be closed over without
     # needing a modal.parameter() -- a single job always transcribes with
     # one model, so one class per job is all that's needed.
     class _RemoteTranscriber:
+        # A plain (non-@modal.method()) helper -- bundled into the same
+        # cloudpickled class as everything else below, unlike a
+        # module-level function would be. serialized=True ships this
+        # class by pickling it directly (see ModalTranscriber.__init__),
+        # and cloudpickle resolves a *module-level* function reference
+        # "by reference" (module path + name) rather than by value --
+        # which, before this was made a method, made the container try
+        # to `import backend.transcription.modal_app` to resolve it and
+        # fail with "No module named 'backend'", since only
+        # faster-whisper is installed in the remote image, never our own
+        # package. A method defined right here has no such problem: it's
+        # part of the one self-contained blob that gets shipped over.
+        def _upload_path(self, upload_id: str) -> str:
+            return f"/tmp/upload_{upload_id}.wav"
+
         @modal.enter()
         def load_model(self):
             # Runs once per container, when it starts -- not per file.
@@ -63,13 +97,24 @@ def _build_transcriber_cls(model_name: str):
             return True
 
         @modal.method()
-        def transcribe(self, audio_bytes: bytes, beam_size: int, progress_queue: modal.Queue | None = None) -> dict:
-            import tempfile
+        def start_upload(self, upload_id: str) -> None:
+            # Truncates/creates the file this upload's chunks will be
+            # appended to -- guards against ever accidentally appending
+            # onto a stale file left by an earlier, unrelated upload_id.
+            with open(self._upload_path(upload_id), "wb"):
+                pass
+
+        @modal.method()
+        def upload_chunk(self, upload_id: str, chunk: bytes) -> None:
+            with open(self._upload_path(upload_id), "ab") as f:
+                f.write(chunk)
+
+        @modal.method()
+        def transcribe(self, upload_id: str, beam_size: int, progress_queue: modal.Queue | None = None) -> dict:
+            import os
             import time
 
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                f.write(audio_bytes)
-                path = f.name
+            path = self._upload_path(upload_id)
 
             # model.transcribe() returns a lazy generator -- inference
             # actually happens while iterating it below, so the timer has
@@ -93,6 +138,13 @@ def _build_transcriber_cls(model_name: str):
                     except Exception:
                         pass
             inference_sec = time.perf_counter() - started
+            # Frees the container's local disk now rather than waiting for
+            # teardown -- matters since every file in the job shares this
+            # same warm container/disk (see ModalTranscriber's docstring).
+            try:
+                os.remove(path)
+            except OSError:
+                pass
             return {"segments": segments, "inference_sec": inference_sec}
 
     return _RemoteTranscriber
@@ -101,13 +153,14 @@ def _build_transcriber_cls(model_name: str):
 class ModalTranscriber:
     """Holds one ephemeral Modal App, one warm container class, and one
     `app.run()` session for an entire job's worth of files. Use as a
-    context manager around the job's Transcription steps:
+    context manager around the job's Upload/Transcription steps:
 
         with ModalTranscriber(gpu, model, token_id, token_secret, hf_token) as t:
             for file in files:
-                t.transcribe(audio_bytes, beam_size, should_cancel=...)
+                t.upload(audio_bytes, upload_id, should_cancel=...)
+                t.transcribe(upload_id, beam_size, should_cancel=...)
 
-    Every file's call within that `with` block reuses the same container
+    Every file's calls within that `with` block reuse the same container
     and the same already-loaded model -- Modal only cold-starts once for
     the whole job (or not at all, if a container from a previous job is
     still warm), instead of once per file.
@@ -190,14 +243,45 @@ class ModalTranscriber:
                     call.cancel(terminate_containers=True)
                     raise StepCancelled("Modal.com setup cancelled") from None
 
-    def transcribe(
+    def upload(
         self,
         audio_bytes: bytes,
+        upload_id: str,
+        should_cancel: Callable[[], bool] | None = None,
+        on_progress: Callable[[float], None] | None = None,
+    ) -> None:
+        """Uploads audio_bytes to the container in UPLOAD_CHUNK_BYTES
+        pieces, each its own blocking RPC, rather than one call carrying
+        the whole payload -- so should_cancel() can be checked between
+        chunks (cancelling mid-upload only ever waits for the current
+        chunk, a few seconds at most, not the whole file) and on_progress
+        gets real bytes-uploaded-so-far. Call once per file before
+        transcribe(upload_id, ...) for that same upload_id."""
+        self._instance.start_upload.remote(upload_id)
+        total = len(audio_bytes)
+        sent = 0
+        for offset in range(0, total, UPLOAD_CHUNK_BYTES):
+            if should_cancel is not None and should_cancel():
+                raise StepCancelled("Modal.com upload cancelled")
+            chunk = audio_bytes[offset:offset + UPLOAD_CHUNK_BYTES]
+            self._instance.upload_chunk.remote(upload_id, chunk)
+            sent += len(chunk)
+            if on_progress is not None:
+                on_progress(sent / total if total > 0 else 1.0)
+
+    def transcribe(
+        self,
+        upload_id: str,
         beam_size: int,
         should_cancel: Callable[[], bool] | None = None,
         on_progress: Callable[[float], None] | None = None,
     ) -> dict:
-        """Returns {"segments": [...], "inference_sec": float}.
+        """Returns {"segments": [...], "inference_sec": float}. Transcribes
+        whatever upload(audio_bytes, upload_id, ...) already placed on the
+        container for this upload_id -- this call itself only ever sends
+        a small id string, not the audio, so it starts immediately rather
+        than blocking on a large upload first.
+
         inference_sec is real GPU inference time only (excludes model
         load, which already happened once for the container) -- used to
         calibrate future time estimates for this (model, GPU) pair;
@@ -214,7 +298,7 @@ class ModalTranscriber:
         running -- otherwise this RPC returns nothing at all until the
         entire file (which can be very long) is fully transcribed."""
         with modal.Queue.ephemeral() as progress_queue:
-            call = self._instance.transcribe.spawn(audio_bytes, beam_size, progress_queue)
+            call = self._instance.transcribe.spawn(upload_id, beam_size, progress_queue)
             while True:
                 if on_progress is not None:
                     for processed_sec in progress_queue.get_many(1000, block=False):

@@ -8,15 +8,27 @@ from __future__ import annotations
 
 from backend.calibration import get_rtf as get_calibrated_rtf
 from backend.calibration import get_setup_sec as get_calibrated_setup_sec
+from backend.calibration import get_upload_bytes_per_sec as get_calibrated_upload_bytes_per_sec
 from backend.config import (
     GPU_OPTIONS,
     GPU_SPEED_MULTIPLIER,
     LOCAL_MODEL_SETUP_SEC,
+    MAX_MODAL_UPLOAD_BYTES,
     MODAL_DOWNLOAD_SEC,
     MODAL_SETUP_SEC,
+    MODAL_UPLOAD_BYTES_PER_SEC,
     RTF_LOCAL_CPU,
     RTF_MODAL_GPU,
+    WAV_BYTES_PER_SEC,
 )
+
+
+class UploadSizeExceededError(ValueError):
+    """Raised by compute_steps() when a Modal.com job's total estimated
+    upload size would exceed MAX_MODAL_UPLOAD_BYTES -- caught in main.py
+    and turned into a 400 so the frontend can show it as a Preview error,
+    the same way any other Preview failure is already surfaced (Begin
+    never appears without a successful Preview to begin with)."""
 
 PHASE_ORDER_LOCAL = [
     "Audio Extraction",
@@ -28,6 +40,7 @@ PHASE_ORDER_LOCAL = [
 PHASE_ORDER_MODAL = [
     "Audio Extraction",
     "Modal.com Setup & Model Install",
+    "Upload audio files to Modal.com",
     "Transcription",
     "Download Transcript to Local",
     "Cleanup - Modal.com Teardown",
@@ -64,6 +77,16 @@ def _estimate_local_setup_sec(model: str) -> float:
     return calibrated if calibrated is not None else LOCAL_MODEL_SETUP_SEC[model]
 
 
+def _estimate_upload_bytes_per_sec() -> float:
+    """Prefers this machine's own real measured Modal.com upload
+    throughput (recorded in pipeline.py after each Upload step
+    completes) once at least one sample exists; otherwise falls back to
+    the static conservative guess -- same self-correcting pattern as
+    _estimate_rtf above."""
+    calibrated = get_calibrated_upload_bytes_per_sec()
+    return calibrated if calibrated is not None else MODAL_UPLOAD_BYTES_PER_SEC
+
+
 def compute_steps(
     files: list[dict],
     model: str,
@@ -90,6 +113,7 @@ def compute_steps(
         if f["type"] == "video":
             steps.append({"file": f, "name": "Audio Extraction", "pass": 0, "sec": (f["duration_sec"] / 60) * 2, "cost": 0.0})
 
+    next_pass = 1
     # Pass 1: Model Setup -- once for the whole job, not per file. Local
     # loads the model into this process and reuses it for every file
     # (engine.py caches it); Modal now keeps one warm container + one
@@ -98,15 +122,44 @@ def compute_steps(
     # cost rather than something every file pays again.
     if is_modal:
         steps.append({
-            "file": None, "name": "Modal.com Setup & Model Install", "pass": 1,
+            "file": None, "name": "Modal.com Setup & Model Install", "pass": next_pass,
             "sec": MODAL_SETUP_SEC, "cost": (MODAL_SETUP_SEC / 3600) * rate,
         })
     else:
-        steps.append({"file": None, "name": "Whisper Model Setup", "pass": 1, "sec": _estimate_local_setup_sec(model), "cost": 0.0})
+        steps.append({"file": None, "name": "Whisper Model Setup", "pass": next_pass, "sec": _estimate_local_setup_sec(model), "cost": 0.0})
+    next_pass += 1
 
-    # Pass 2: Transcription for every file -- kept as one contiguous pass
-    # (even for Modal, where the download already happens as part of the
-    # same RPC call as transcription -- see modal_app.py's transcribe())
+    # Pass 2 (Modal only): Upload audio files to Modal.com -- every file,
+    # its own contiguous pass so every file's upload finishes before any
+    # file's Transcription starts (matching the Transcription/Download
+    # split below). Modal bills container time while the upload RPCs
+    # run, so this carries a real (if rough -- upload speed varies
+    # enormously by connection) cost estimate rather than $0.
+    if is_modal:
+        # Every file in the job sits fully uploaded on the same shared
+        # container's /tmp at once before any of them are transcribed and
+        # deleted (see MAX_MODAL_UPLOAD_BYTES's docstring in config.py) --
+        # so the batch *total*, not any single file, is what has to stay
+        # under Modal's per-container disk quota.
+        total_upload_bytes = sum(f["duration_sec"] * WAV_BYTES_PER_SEC for f in files)
+        if total_upload_bytes > MAX_MODAL_UPLOAD_BYTES:
+            raise UploadSizeExceededError(
+                f"Selected files would need to upload about "
+                f"{total_upload_bytes / 1_000_000_000:.0f} GB to Modal.com, which exceeds the "
+                f"{MAX_MODAL_UPLOAD_BYTES / 1_000_000_000:.0f} GB limit for a single job. "
+                f"Select fewer files, or switch to Local execution."
+            )
+
+        upload_bytes_per_sec = _estimate_upload_bytes_per_sec()
+        for f in files:
+            upload_sec = (f["duration_sec"] * WAV_BYTES_PER_SEC) / upload_bytes_per_sec
+            steps.append({
+                "file": f, "name": "Upload audio files to Modal.com", "pass": next_pass,
+                "sec": upload_sec, "cost": (upload_sec / 3600) * rate,
+            })
+        next_pass += 1
+
+    # Pass 3: Transcription for every file -- kept as one contiguous pass
     # so every file's Transcription genuinely finishes, in the real
     # execution order, before any file's Download phase starts. When they
     # were interleaved per file, the two showed as running at once with
@@ -114,12 +167,12 @@ def compute_steps(
     for f in files:
         transcription_sec = f["duration_sec"] * rtf
         steps.append({
-            "file": f, "name": "Transcription", "pass": 2,
+            "file": f, "name": "Transcription", "pass": next_pass,
             "sec": transcription_sec, "cost": (transcription_sec / 3600) * rate if is_modal else 0.0,
         })
+    next_pass += 1
 
-    next_pass = 3
-    # Pass 3 (Modal only): Download Transcript to Local -- a formality by
+    # Pass 4 (Modal only): Download Transcript to Local -- a formality by
     # this point (the transcript is already written to disk as part of
     # Transcription above); kept as its own pass purely for the time/cost
     # line item, and so it's only ever shown starting once every file's

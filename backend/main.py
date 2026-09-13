@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.estimator import aggregate_phases, compute_steps
+from backend.estimator import UploadSizeExceededError, aggregate_phases, compute_steps
 from backend.ffmpeg_utils import FfmpegNotFoundError
 from backend.jobs import create_job, get_job, request_cancel
 from backend.models import PreferencesModel, PreviewRequest, ScanRequest, TranscribeRequest
@@ -120,7 +120,10 @@ def api_preview(req: PreviewRequest):
     if req.execution == "modal" and not req.gpu:
         raise HTTPException(status_code=400, detail="GPU type is required for Modal.com execution.")
     files = [f.model_dump() for f in req.files]
-    steps = compute_steps(files, req.model, req.execution, req.gpu, req.cleanup)
+    try:
+        steps = compute_steps(files, req.model, req.execution, req.gpu, req.cleanup)
+    except UploadSizeExceededError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     phases = aggregate_phases(steps, req.execution, req.cleanup)
     total_sec = sum(p["sec"] for p in phases)
     total_cost = sum(p["cost"] for p in phases)
@@ -131,8 +134,15 @@ def api_preview(req: PreviewRequest):
 async def api_transcribe(req: TranscribeRequest):
     if req.execution == "modal" and not (req.modal_token_id and req.modal_token_secret):
         raise HTTPException(status_code=400, detail="Modal Token ID and Token Secret are required for Modal.com execution.")
-    job = create_job()
     files = [f.model_dump() for f in req.files]
+    try:
+        # Defense in depth -- Begin never appears without a successful
+        # Preview first (which already runs this same check), but this
+        # endpoint could in principle be called directly.
+        compute_steps(files, req.model, req.execution, req.gpu, req.cleanup)
+    except UploadSizeExceededError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    job = create_job()
     asyncio.create_task(run_job_safe(
         job, req.folder_path, files, req.model, req.formats, req.execution, req.gpu, req.cleanup,
         req.modal_token_id, req.modal_token_secret, req.hf_token,

@@ -1,11 +1,13 @@
 """Phase-wise pipeline: every file goes through Audio Extraction together,
 then Model Setup (once for the whole job -- Whisper Model Setup locally,
-Modal.com Setup & Model Install remotely), then Transcription (+ Download
-per file for Modal, bundled into the same RPC call), then Teardown/Release
-(once for the whole job), then Cleanup -- rather than one file finishing
-all its phases before the next file starts. Runs entirely in a worker
-thread per step (via asyncio.to_thread) so it doesn't block the event
-loop, and reports progress/log events through the job's queue as it goes.
+Modal.com Setup & Model Install remotely), then (Modal only) Upload to
+Modal.com, then Transcription (+ Download per file for Modal -- a
+formality by that point, the transcript is already written), then
+Teardown/Release (once for the whole job), then Cleanup -- rather than
+one file finishing all its phases before the next file starts. Runs
+entirely in a worker thread per step (via asyncio.to_thread) so it
+doesn't block the event loop, and reports progress/log events through
+the job's queue as it goes.
 
 A file that fails one phase is skipped (not retried) in every later
 phase -- it doesn't stop the rest of the job, and its skipped steps still
@@ -18,6 +20,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Callable
@@ -56,6 +59,8 @@ def _step_label(step: dict, model: str, execution: str) -> str:
         return f"Loading {model} model (downloading if not already cached)"
     if name == "Modal.com Setup & Model Install":
         return f"Setting up Modal.com & installing {model} model (once for the whole job)"
+    if name == "Upload audio files to Modal.com":
+        return f"Uploading to Modal.com: {path}"
     if name == "Transcription":
         return f"Transcribing ({execution}, {model}): {path}"
     if name == "Download Transcript to Local":
@@ -118,7 +123,7 @@ def _run_single_step(
     label = _step_label(step, model_name, execution)
     job.emit({"event": "log", "text": label, "step": step["name"]})
     job.emit({"event": "step_start", "step": step["name"]})
-    if progress_cb is not None and step["name"] in ("Audio Extraction", "Transcription"):
+    if progress_cb is not None and step["name"] in ("Audio Extraction", "Upload audio files to Modal.com", "Transcription"):
         # Shows "(0%)" the instant the step starts, for both local and
         # Modal execution, instead of leaving the suffix blank until the
         # first real segment/progress event arrives -- which, for Modal
@@ -187,6 +192,41 @@ def _run_single_step(
                 raise
             real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
 
+        elif step["name"] == "Upload audio files to Modal.com":
+            abs_path = folder_path / file_info["path"]
+            wav_path = file_state[file_info["path"]].get("wav_path")
+            audio_path = wav_path if wav_path is not None else abs_path
+            upload_id = uuid.uuid4().hex
+            audio_bytes = audio_path.read_bytes()
+
+            def on_upload_progress(fraction: float) -> None:
+                if progress_cb is not None:
+                    progress_cb(fraction)
+
+            started = time.perf_counter()
+            try:
+                modal_transcriber.upload(
+                    audio_bytes, upload_id,
+                    should_cancel=should_cancel, on_progress=on_upload_progress,
+                )
+            except StepCancelled:
+                # Cancelling still bills for the container time already
+                # spent receiving chunks -- same reasoning as every other
+                # Modal step's cost tracking. Not recorded as a calibration
+                # sample: a cancelled upload's elapsed time doesn't reflect
+                # genuine full-file throughput.
+                real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
+                raise
+            elapsed = time.perf_counter() - started
+            real_cost = (elapsed / 3600) * _gpu_rate(gpu)
+            if elapsed > 0:
+                calibration.record_upload_sample(len(audio_bytes) / elapsed)
+            # Handed to the Transcription step for this same file below --
+            # no separate cleanup needed for the uploaded temp file itself:
+            # the remote transcribe() call deletes it once done, and
+            # anything left over is gone once the container is torn down.
+            file_state[file_info["path"]]["modal_upload_id"] = upload_id
+
         elif step["name"] == "Transcription":
             abs_path = folder_path / file_info["path"]
             wav_path = file_state[file_info["path"]].get("wav_path")
@@ -203,10 +243,11 @@ def _run_single_step(
                     progress_cb(min(1.0, end_sec / file_duration_sec))
 
             if execution == "modal":
+                upload_id = file_state[file_info["path"]]["modal_upload_id"]
                 started = time.perf_counter()
                 try:
                     raw = modal_transcriber.transcribe(
-                        audio_path.read_bytes(), BEAM_SIZE,
+                        upload_id, BEAM_SIZE,
                         should_cancel=should_cancel, on_progress=on_segment_end,
                     )
                 except StepCancelled:
@@ -320,19 +361,21 @@ async def run_job(
     started_at = time.perf_counter()
     cancelled = False
 
-    # Audio Extraction and Transcription both report real per-file
-    # progress. Two different audiences want two different numbers out of
-    # that: the scrolling log line is about *this file*, so it correctly
-    # resets to 0% at the start of each new file -- but the Steps table
-    # has one row per phase for the *whole batch*, so its "(NN%)" should
-    # read as one continuous 0->100% sweep across every file in that
-    # phase, not repeatedly reset. batch_progress_done tracks how many
-    # seconds of audio have already been fully accounted for in each
-    # phase (advanced in the main loop below); batch_progress_total is
-    # the fixed denominator for each (only video files go through Audio
-    # Extraction; every file goes through Transcription).
+    # Audio Extraction, Upload audio files to Modal.com, and Transcription
+    # all report real per-file progress. Two different audiences want two
+    # different numbers out of that: the scrolling log line is about *this file*,
+    # so it correctly resets to 0% at the start of each new file -- but
+    # the Steps table has one row per phase for the *whole batch*, so its
+    # "(NN%)" should read as one continuous 0->100% sweep across every
+    # file in that phase, not repeatedly reset. batch_progress_done
+    # tracks how many seconds of audio have already been fully accounted
+    # for in each phase (advanced in the main loop below);
+    # batch_progress_total is the fixed denominator for each (only video
+    # files go through Audio Extraction; every file goes through Upload
+    # and Transcription).
     batch_progress_total = {
         "Audio Extraction": sum(f["duration_sec"] for f in files if f["type"] == "video") or 1.0,
+        "Upload audio files to Modal.com": sum(f["duration_sec"] for f in files) or 1.0,
         "Transcription": sum(f["duration_sec"] for f in files) or 1.0,
     }
     batch_progress_done = {name: 0.0 for name in batch_progress_total}
