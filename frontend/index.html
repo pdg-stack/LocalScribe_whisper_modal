@@ -172,6 +172,21 @@
     </section>
   </main>
 
+  <!-- Fatal-error dialog: for a job-ending error that isn't a normal
+       per-file failure (e.g. the batch's real upload size exceeds
+       Modal.com's limit) -- shown over the page in addition to the
+       matching line already in the execution log below. -->
+  <div id="fatal-error-overlay" class="modal-overlay" hidden>
+    <div class="modal-dialog" role="alertdialog" aria-labelledby="fatal-error-title" aria-describedby="fatal-error-message">
+      <h2 id="fatal-error-title">Job stopped</h2>
+      <p id="fatal-error-message"></p>
+      <div class="modal-actions">
+        <button id="fatal-error-cancel-btn" class="btn btn-secondary">Cancel</button>
+        <button id="fatal-error-ok-btn" class="btn btn-primary">OK</button>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>

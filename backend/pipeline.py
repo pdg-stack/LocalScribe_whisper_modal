@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Callable
 
 from backend import calibration
-from backend.config import BEAM_SIZE, GPU_OPTIONS
+from backend.config import BEAM_SIZE, GPU_OPTIONS, MAX_MODAL_UPLOAD_BYTES
 from backend.estimator import aggregate_phases, compute_steps
 from backend.ffmpeg_utils import FfmpegNotFoundError, extract_audio
 from backend.jobs import Job, StepCancelled
@@ -433,6 +433,19 @@ async def run_job(
     local_model_acquired = False
     local_model_released = False
 
+    # The /api/preview-time check (estimator.py's UploadSizeExceededError)
+    # is a fast, cheap pre-filter based on estimated duration*bitrate --
+    # good enough to reject an obviously oversized batch before spending
+    # any time on Setup or Extraction at all. But it's still an estimate:
+    # a video's real extracted WAV size, or a non-WAV audio file's actual
+    # size on disk, can differ from that estimate. This is the
+    # authoritative check on *real* bytes, run once -- right after
+    # Extraction has produced real WAVs (or immediately, if the batch is
+    # audio-only and there's nothing to extract) and before the
+    # expensive Upload/Transcription phases actually start spending
+    # money.
+    upload_size_checked = False
+
     try:
         for phase_pass in main_passes:
             if cancelled:
@@ -442,6 +455,29 @@ async def run_job(
                 logger.info("Job %s cancelled before pass %d", job.id, phase_pass["pass"])
                 cancelled = True
                 break
+
+            if execution == "modal" and not upload_size_checked and phase_pass["steps"][0]["name"] != "Audio Extraction":
+                upload_size_checked = True
+                real_upload_bytes = 0
+                for f in files:
+                    if f["path"] in failed_files:
+                        continue  # never reaches Upload, doesn't count
+                    real_path = file_state.get(f["path"], {}).get("wav_path") or (folder / f["path"])
+                    try:
+                        real_upload_bytes += real_path.stat().st_size
+                    except OSError:
+                        pass  # best-effort -- a missing file fails its own step later anyway
+                if real_upload_bytes > MAX_MODAL_UPLOAD_BYTES:
+                    message = (
+                        f"Selected files need to upload about {real_upload_bytes / 1_000_000_000:.0f} GB to "
+                        f"Modal.com, which exceeds the {MAX_MODAL_UPLOAD_BYTES / 1_000_000_000:.0f} GB limit "
+                        "for a single job. Cancelling -- select fewer files, or switch to Local execution."
+                    )
+                    job.emit({"event": "log", "text": message, "fail": True})
+                    job.emit({"event": "fatal_error", "text": message})
+                    logger.info("Job %s aborted: real upload size %d bytes exceeds limit", job.id, real_upload_bytes)
+                    cancelled = True
+                    break
 
             for step in phase_pass["steps"]:
                 file_info = step["file"]

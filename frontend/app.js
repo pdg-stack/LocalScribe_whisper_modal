@@ -662,6 +662,27 @@ const diagnosticsStep = document.getElementById("diagnostics-step");
 const diagnosticsSummary = document.getElementById("diagnostics-summary");
 const diagnosticsTableBody = document.getElementById("diagnostics-table-body");
 const previewSelectionSummary = document.getElementById("preview-selection-summary");
+const fatalErrorOverlay = document.getElementById("fatal-error-overlay");
+const fatalErrorMessage = document.getElementById("fatal-error-message");
+const fatalErrorOkBtn = document.getElementById("fatal-error-ok-btn");
+const fatalErrorCancelBtn = document.getElementById("fatal-error-cancel-btn");
+
+function showFatalErrorDialog(text) {
+  fatalErrorMessage.textContent = text;
+  fatalErrorOverlay.hidden = false;
+}
+
+function hideFatalErrorDialog() {
+  fatalErrorOverlay.hidden = true;
+}
+
+// Both buttons just dismiss the dialog -- by the time this event arrives
+// the backend has already decided the job can't continue (e.g. the
+// batch's real upload size exceeds Modal.com's limit) and is already
+// winding down on its own, so there's no different action for OK vs.
+// Cancel to actually take beyond acknowledging the message.
+fatalErrorOkBtn.addEventListener("click", hideFatalErrorDialog);
+fatalErrorCancelBtn.addEventListener("click", hideFatalErrorDialog);
 
 function invalidatePreview() {
   // Begin only ever appears right after a fresh Preview -- any change to
@@ -873,6 +894,7 @@ beginBtn.addEventListener("click", async () => {
   cancelBtn.disabled = false;
   cancelBtn.textContent = "Cancel";
   beginBtn.disabled = true;
+  hideFatalErrorDialog();
 
   const req = buildTranscribeRequest();
   const expected = computeExpectedPhaseCounts(req.files, req.execution, req.cleanup);
@@ -908,6 +930,14 @@ beginBtn.addEventListener("click", async () => {
         activeProgressStep = event.step;
         activeProgressLine = line;
         activeProgressBaseText = event.text;
+      } else if (event.event === "fatal_error") {
+        // A job-ending error distinct from any single file/step failing
+        // (e.g. the batch's real upload size exceeds Modal.com's limit,
+        // checked right after Audio Extraction produces real file sizes)
+        // -- already shown in the log above via its own "log" event;
+        // this additionally surfaces it as a dialog over the page, since
+        // it means the whole job is being abandoned, not just one file.
+        showFatalErrorDialog(event.text);
       } else if (event.event === "step_progress") {
         // step_progress only ever arrives for Audio Extraction and
         // Transcription (see pipeline.py), so no name check is needed
