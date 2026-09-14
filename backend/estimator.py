@@ -8,23 +8,43 @@ from __future__ import annotations
 
 from backend.calibration import get_rtf as get_calibrated_rtf
 from backend.calibration import get_setup_sec as get_calibrated_setup_sec
+from backend.calibration import get_upload_bytes_per_sec as get_calibrated_upload_bytes_per_sec
 from backend.config import (
     GPU_OPTIONS,
     GPU_SPEED_MULTIPLIER,
     LOCAL_MODEL_SETUP_SEC,
+    MAX_MODAL_UPLOAD_BYTES,
     MODAL_DOWNLOAD_SEC,
     MODAL_SETUP_SEC,
+    MODAL_UPLOAD_BYTES_PER_SEC,
     RTF_LOCAL_CPU,
     RTF_MODAL_GPU,
+    WAV_BYTES_PER_SEC,
 )
 
-PHASE_ORDER_LOCAL = ["Audio Extraction", "Whisper Model Setup", "Transcription", "Cleanup"]
+
+class UploadSizeExceededError(ValueError):
+    """Raised by compute_steps() when a Modal.com job's total estimated
+    upload size would exceed MAX_MODAL_UPLOAD_BYTES -- caught in main.py
+    and turned into a 400 so the frontend can show it as a Preview error,
+    the same way any other Preview failure is already surfaced (Begin
+    never appears without a successful Preview to begin with)."""
+
+PHASE_ORDER_LOCAL = [
+    "Audio Extraction",
+    "Whisper Model Setup",
+    "Transcription",
+    "Cleanup - Release Whisper Model",
+    "Cleanup - Intermediate Files",
+]
 PHASE_ORDER_MODAL = [
     "Audio Extraction",
     "Modal.com Setup & Model Install",
+    "Upload audio files to Modal.com",
     "Transcription",
     "Download Transcript to Local",
-    "Cleanup",
+    "Cleanup - Modal.com Teardown",
+    "Cleanup - Intermediate Files",
 ]
 
 
@@ -57,6 +77,16 @@ def _estimate_local_setup_sec(model: str) -> float:
     return calibrated if calibrated is not None else LOCAL_MODEL_SETUP_SEC[model]
 
 
+def _estimate_upload_bytes_per_sec() -> float:
+    """Prefers this machine's own real measured Modal.com upload
+    throughput (recorded in pipeline.py after each Upload step
+    completes) once at least one sample exists; otherwise falls back to
+    the static conservative guess -- same self-correcting pattern as
+    _estimate_rtf above."""
+    calibrated = get_calibrated_upload_bytes_per_sec()
+    return calibrated if calibrated is not None else MODAL_UPLOAD_BYTES_PER_SEC
+
+
 def compute_steps(
     files: list[dict],
     model: str,
@@ -83,36 +113,94 @@ def compute_steps(
         if f["type"] == "video":
             steps.append({"file": f, "name": "Audio Extraction", "pass": 0, "sec": (f["duration_sec"] / 60) * 2, "cost": 0.0})
 
-    # Pass 1 (local only): Whisper Model Setup -- once for the whole job,
-    # not per file (the model loads once and is reused). Modal has no
-    # equivalent standalone pass: its setup is genuinely per-file (see
-    # pass 2 below), since each call spins up a fresh ephemeral container.
-    if not is_modal:
-        steps.append({"file": None, "name": "Whisper Model Setup", "pass": 1, "sec": _estimate_local_setup_sec(model), "cost": 0.0})
+    next_pass = 1
+    # Pass 1: Model Setup -- once for the whole job, not per file. Local
+    # loads the model into this process and reuses it for every file
+    # (engine.py caches it); Modal now keeps one warm container + one
+    # already-loaded model for the whole job too (see modal_app.py's
+    # ModalTranscriber), so its cold start is likewise a single job-level
+    # cost rather than something every file pays again.
+    if is_modal:
+        steps.append({
+            "file": None, "name": "Modal.com Setup & Model Install", "pass": next_pass,
+            "sec": MODAL_SETUP_SEC, "cost": (MODAL_SETUP_SEC / 3600) * rate,
+        })
+    else:
+        steps.append({"file": None, "name": "Whisper Model Setup", "pass": next_pass, "sec": _estimate_local_setup_sec(model), "cost": 0.0})
+    next_pass += 1
 
-    # Pass 2: Transcription. For Modal this bundles Setup+Transcribe+
-    # Download into one RPC call per file (can't be split further -- see
-    # modal_app.py) -- still shown as 3 rows, but they execute together,
-    # file by file, within this one pass.
-    for f in files:
-        if is_modal:
+    # Pass 2 (Modal only): Upload audio files to Modal.com -- every file,
+    # its own contiguous pass so every file's upload finishes before any
+    # file's Transcription starts (matching the Transcription/Download
+    # split below). Modal bills container time while the upload RPCs
+    # run, so this carries a real (if rough -- upload speed varies
+    # enormously by connection) cost estimate rather than $0.
+    if is_modal:
+        # Every file in the job sits fully uploaded on the same shared
+        # container's /tmp at once before any of them are transcribed and
+        # deleted (see MAX_MODAL_UPLOAD_BYTES's docstring in config.py) --
+        # so the batch *total*, not any single file, is what has to stay
+        # under Modal's per-container disk quota.
+        total_upload_bytes = sum(f["duration_sec"] * WAV_BYTES_PER_SEC for f in files)
+        if total_upload_bytes > MAX_MODAL_UPLOAD_BYTES:
+            raise UploadSizeExceededError(
+                f"Selected files would need to upload about "
+                f"{total_upload_bytes / 1_000_000_000:.0f} GB to Modal.com, which exceeds the "
+                f"{MAX_MODAL_UPLOAD_BYTES / 1_000_000_000:.0f} GB limit for a single job. "
+                f"Select fewer files, or switch to Local execution."
+            )
+
+        upload_bytes_per_sec = _estimate_upload_bytes_per_sec()
+        for f in files:
+            upload_sec = (f["duration_sec"] * WAV_BYTES_PER_SEC) / upload_bytes_per_sec
             steps.append({
-                "file": f, "name": "Modal.com Setup & Model Install", "pass": 2,
-                "sec": MODAL_SETUP_SEC, "cost": (MODAL_SETUP_SEC / 3600) * rate,
+                "file": f, "name": "Upload audio files to Modal.com", "pass": next_pass,
+                "sec": upload_sec, "cost": (upload_sec / 3600) * rate,
             })
+        next_pass += 1
+
+    # Pass 3: Transcription for every file -- kept as one contiguous pass
+    # so every file's Transcription genuinely finishes, in the real
+    # execution order, before any file's Download phase starts. When they
+    # were interleaved per file, the two showed as running at once with
+    # nothing to explain why.
+    for f in files:
         transcription_sec = f["duration_sec"] * rtf
         steps.append({
-            "file": f, "name": "Transcription", "pass": 2,
+            "file": f, "name": "Transcription", "pass": next_pass,
             "sec": transcription_sec, "cost": (transcription_sec / 3600) * rate if is_modal else 0.0,
         })
-        if is_modal:
-            steps.append({"file": f, "name": "Download Transcript to Local", "pass": 2, "sec": MODAL_DOWNLOAD_SEC, "cost": 0.0})
+    next_pass += 1
 
-    # Pass 3: Cleanup -- every video file, once all transcriptions are done.
+    # Pass 4 (Modal only): Download Transcript to Local -- a formality by
+    # this point (the transcript is already written to disk as part of
+    # Transcription above); kept as its own pass purely for the time/cost
+    # line item, and so it's only ever shown starting once every file's
+    # Transcription has actually finished.
+    if is_modal:
+        for f in files:
+            steps.append({"file": f, "name": "Download Transcript to Local", "pass": next_pass, "sec": MODAL_DOWNLOAD_SEC, "cost": 0.0})
+        next_pass += 1
+
+    # Pass N: Release Resources -- always runs, unlike the Cleanup pass
+    # below, since it's not a user preference but releasing something
+    # that's actively costing money (Modal) or holding memory (local).
+    # Runs once the whole job is done and before file Cleanup, so a
+    # container/model teardown failure can't leave WAVs undeleted behind
+    # it -- pipeline.py catches and logs a teardown failure without
+    # stopping the job from reaching Cleanup.
+    if is_modal:
+        steps.append({"file": None, "name": "Cleanup - Modal.com Teardown", "pass": next_pass, "sec": 2.0, "cost": 0.0})
+    else:
+        steps.append({"file": None, "name": "Cleanup - Release Whisper Model", "pass": next_pass, "sec": 1.0, "cost": 0.0})
+    next_pass += 1
+
+    # Pass N+1: delete the intermediate WAVs -- every video file, once all
+    # transcriptions are done.
     if cleanup:
         for f in files:
             if f["type"] == "video":
-                steps.append({"file": f, "name": "Cleanup", "pass": 3, "sec": 1.0, "cost": 0.0})
+                steps.append({"file": f, "name": "Cleanup - Intermediate Files", "pass": next_pass, "sec": 1.0, "cost": 0.0})
 
     return steps
 
@@ -126,5 +214,5 @@ def aggregate_phases(steps: list[dict], execution: str, cleanup: bool) -> list[d
     return [
         {"name": name, "sec": totals[name]["sec"], "cost": totals[name]["cost"]}
         for name in order
-        if name != "Cleanup" or cleanup
+        if name != "Cleanup - Intermediate Files" or cleanup
     ]

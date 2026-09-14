@@ -15,8 +15,16 @@
 
     <!-- Step 1: Folder -->
     <section class="card" id="folder-step">
+      <label for="folder-path" class="field-label">Full path of your local folder containing media files to transcribe.</label>
+      <p class="hint sub-label">Supported: .mp4, .mov, .mkv, .avi, .webm, .m4v, .wmv, .flv (video) &middot; .mp3, .wav, .m4a, .flac, .aac, .ogg, .wma (audio)</p>
       <div class="row">
-        <input type="text" id="folder-path" placeholder="Paste a folder path, e.g. D:\Videos\Project" />
+        <div class="folder-input-wrap">
+          <button type="button" id="browse-folder-btn" class="icon-btn" aria-label="Browse for a folder" title="Browse for a folder">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+          </button>
+          <input type="text" id="folder-path" placeholder="Paste a folder path, e.g. D:\Videos\Project" autocomplete="off" />
+          <ul id="folder-history-dropdown" class="folder-history-dropdown" hidden></ul>
+        </div>
         <button id="analyze-btn" class="btn btn-primary">Analyze</button>
         <button id="reset-btn" class="btn btn-secondary">Reset</button>
       </div>
@@ -43,7 +51,10 @@
     <!-- Step 3: Options -->
     <section class="card" id="options-step" hidden>
       <div class="field-row">
-        <label for="model-select">Whisper model</label>
+        <label for="model-select">
+          <a href="https://github.com/SYSTRAN/faster-whisper" target="_blank" rel="noopener noreferrer">Whisper model</a>
+          <span class="hint">(faster-whisper)</span>
+        </label>
         <select id="model-select">
           <option value="tiny">tiny</option>
           <option value="base">base</option>
@@ -126,7 +137,7 @@
         <p class="summary-line" id="preview-selection-summary"></p>
         <table class="phase-table">
           <thead>
-            <tr><th>Phase</th><th>Est. time</th><th>Est. cost</th></tr>
+            <tr><th>Steps</th><th>Est. time</th><th>Est. cost</th></tr>
           </thead>
           <tbody id="preview-table-body"></tbody>
         </table>
@@ -160,6 +171,21 @@
       <p class="hint">Full per-file logs saved under <code>logs/</code> locally.</p>
     </section>
   </main>
+
+  <!-- Fatal-error dialog: for a job-ending error that isn't a normal
+       per-file failure (e.g. the batch's real upload size exceeds
+       Modal.com's limit) -- shown over the page in addition to the
+       matching line already in the execution log below. -->
+  <div id="fatal-error-overlay" class="modal-overlay" hidden>
+    <div class="modal-dialog" role="alertdialog" aria-labelledby="fatal-error-title" aria-describedby="fatal-error-message">
+      <h2 id="fatal-error-title">Job stopped</h2>
+      <p id="fatal-error-message"></p>
+      <div class="modal-actions">
+        <button id="fatal-error-cancel-btn" class="btn btn-secondary">Cancel</button>
+        <button id="fatal-error-ok-btn" class="btn btn-primary">OK</button>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

@@ -9,12 +9,16 @@ accurate the more a given (model, device) combination is actually used,
 and reflect this machine/account's real performance rather than someone
 else's benchmark.
 
-Two kinds of value are tracked, both as a running average keyed by
-(model, device):
+Three kinds of value are tracked, as a running average:
 - "rtf" -- transcription real-time-factor (seconds of processing per
-  second of audio), used to scale with file duration.
+  second of audio), keyed by (model, device), used to scale with file
+  duration.
 - "setup" -- one-time model load/install duration in seconds (roughly
-  constant regardless of audio length).
+  constant regardless of audio length), keyed by (model, device).
+- "upload" -- measured Modal.com upload throughput in bytes/sec. Not
+  keyed by model/device (upload speed is a property of this machine's
+  network connection, not the Whisper model or GPU) -- uses a single
+  fixed key instead.
 
 Stored at project root as rtf_calibration.json (gitignored -- it's local
 performance data, not something to commit; a different machine or Modal
@@ -49,7 +53,14 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
-    CALIBRATION_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        CALIBRATION_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        # Best-effort self-tuning data -- a write failure here (disk full,
+        # permissions) must never surface as a failure of the step that
+        # happened to trigger it (Whisper Model Setup / Transcription),
+        # both of which have already done their real work by this point.
+        pass
 
 
 def _get(kind: str, model: str, device: str) -> float | None:
@@ -84,3 +95,11 @@ def get_setup_sec(model: str, device: str) -> float | None:
 
 def record_setup_sample(model: str, device: str, seconds: float) -> None:
     _record("setup", model, device, seconds)
+
+
+def get_upload_bytes_per_sec() -> float | None:
+    return _get("upload", "_", "_")
+
+
+def record_upload_sample(bytes_per_sec: float) -> None:
+    _record("upload", "_", "_", bytes_per_sec)
