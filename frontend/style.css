@@ -490,7 +490,10 @@ body {
 
 .begin-row {
   display: flex;
-  justify-content: center;
+  justify-content: flex-start;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
 }
 
 /* `.begin-row`'s own `display: flex` has the same specificity as the
@@ -499,6 +502,66 @@ body {
    override is what actually keeps Begin hidden until Preview runs. */
 .begin-row[hidden] {
   display: none;
+}
+
+.job-id-display {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+
+/* Same tie as `.begin-row[hidden]` above: `.job-id-display`'s own
+   `display: inline-flex` has the same specificity as the browser
+   default `[hidden] { display: none }` and wins it (author styles beat
+   UA styles at equal specificity), so without this override the "Job
+   ID:" label + copy icon show up immediately once begin-row/run-step
+   become visible -- with nothing to show yet -- instead of staying
+   hidden until showJobIdDisplay() actually reveals them. */
+.job-id-display[hidden] {
+  display: none;
+}
+
+/* The run-step copy sits above the progress bar (its own line, a <p>
+   with default browser margins) rather than inline in a flex row like
+   the begin-row copy -- needs its own bottom spacing. */
+#run-job-id-display {
+  margin: 0 0 10px;
+}
+
+.job-id-display code {
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  color: var(--text);
+}
+
+.copy-btn {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--card-bg);
+  color: var(--text-dim);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.copy-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.copy-btn.copied {
+  color: var(--success);
+  border-color: var(--success);
 }
 
 /* Run step */

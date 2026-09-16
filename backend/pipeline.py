@@ -25,7 +25,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Callable
 
-from backend import calibration
+import modal.exception
+
+from backend import calibration, sleep_guard
 from backend.config import BEAM_SIZE, GPU_OPTIONS, MAX_MODAL_UPLOAD_BYTES
 from backend.estimator import aggregate_phases, compute_steps
 from backend.ffmpeg_utils import FfmpegNotFoundError, extract_audio
@@ -50,7 +52,7 @@ def _group_by_pass(steps: list[dict]) -> list[dict]:
     return groups
 
 
-def _step_label(step: dict, model: str, execution: str) -> str:
+def _step_label(step: dict, model: str, execution: str, formats: list[str] | None = None) -> str:
     name = step["name"]
     path = step["file"]["path"] if step["file"] else None
     if name == "Audio Extraction":
@@ -60,11 +62,23 @@ def _step_label(step: dict, model: str, execution: str) -> str:
     if name == "Modal.com Setup & Model Install":
         return f"Setting up Modal.com & installing {model} model (once for the whole job)"
     if name == "Upload audio files to Modal.com":
-        return f"Uploading to Modal.com: {path}"
-    if name == "Transcription":
+        # The actual bytes sent: the extracted .wav (same name, swapped
+        # extension) for a video file, or the original file itself for an
+        # audio file (nothing was extracted for it) -- matches exactly
+        # what the Upload step below actually reads (wav_path if set,
+        # else the original path), determined the same way: by the
+        # file's type, not by looking up file_state (which isn't in
+        # scope here, and isn't needed -- video always means a .wav
+        # sibling was produced by Audio Extraction, unconditionally).
+        upload_name = str(Path(path).with_suffix(".wav")) if step["file"]["type"] == "video" else path
+        return f"Uploading to Modal.com: {upload_name}"
+    if name in ("Transcription", "Transcription & Download"):
         return f"Transcribing ({execution}, {model}): {path}"
-    if name == "Download Transcript to Local":
-        return f"Downloading transcript: {path}"
+    if name == "Cleanup - Modal.com Audio Uploads":
+        # Same actual-file-identity logic as Upload above -- this is
+        # cleaning up exactly what that step sent.
+        upload_name = str(Path(path).with_suffix(".wav")) if step["file"]["type"] == "video" else path
+        return f"Cleaning up Modal.com audio: {upload_name}"
     if name == "Cleanup - Modal.com Teardown":
         return "Tearing down the Modal.com container"
     if name == "Cleanup - Release Whisper Model":
@@ -74,12 +88,62 @@ def _step_label(step: dict, model: str, execution: str) -> str:
     return f"{name}: {path}"
 
 
+def _is_modal_session_dead(exc: Exception) -> bool:
+    """True for the specific Modal.com error that means the job's whole
+    ephemeral App/container session has been torn down server-side --
+    observed in practice (see this project's logs/ for a real example)
+    when this machine went to sleep/hibernated mid-run: Modal.com's
+    backend stops the app once the local client holding it open goes
+    unreachable for too long. Every remaining file in the job would then
+    fail the exact same way (the shared container is gone -- see
+    modal_app.py's docstring on why one container is reused for the
+    whole job), so this is treated as job-ending rather than a per-file
+    failure. modal.exception.ConflictError also covers unrelated,
+    genuinely per-file conflicts (e.g. Volume commit races), so this
+    only matches the "stopped" wording actually seen for a torn-down
+    session, not every ConflictError."""
+    return isinstance(exc, modal.exception.ConflictError) and "stopped" in str(exc).lower()
+
+
+def _is_missing_remote_upload(exc: Exception) -> bool:
+    """True for a Transcription failure caused by Modal.com not having
+    this file's uploaded audio (or only a corrupt/partial copy of it) at
+    the path modal_app.py's _upload_path() writes to (AUDIO_UPLOAD_DIR,
+    on the AUDIO_UPLOAD_VOLUME Volume as of the fix described in
+    modal_app.py's docstring there -- kept as a retry safety net even
+    with that fix, for the narrower remaining window: a container
+    replaced mid-upload, before that file's own commit_upload() ran).
+    Surfaced by faster-whisper/PyAV as either FileNotFoundError (nothing
+    there at all) or InvalidDataError (a partial file that doesn't parse
+    as audio) -- a Modal.com-side problem, never anything wrong with the
+    user's actual source file. Matched by the path text itself (present
+    in both exception messages) rather than exception type, since the
+    two failure modes don't share a common base class beyond Exception.
+    Derived from the real constant (not a separately hardcoded path
+    fragment) so the two can never silently drift out of sync again --
+    exactly what happened here once already, when this still checked for
+    the old "/tmp/upload_" local-disk path after the Volume move."""
+    return f"{modal_app.AUDIO_UPLOAD_DIR}/upload_" in str(exc)
+
+
 def _friendly_error(exc: Exception) -> str:
     text = str(exc) or exc.__class__.__name__
     lower = text.lower()
 
     if isinstance(exc, FfmpegNotFoundError):
         return text  # already a clear, actionable message
+    if isinstance(exc, modal.exception.FunctionTimeoutError):
+        return (
+            "Modal.com stopped this call because it ran longer than this job's per-call time "
+            "limit -- an unusually long file, a slower GPU, or Modal.com being under load can "
+            "all cause this. Try again, or a faster/smaller GPU or Whisper model."
+        )
+    if _is_missing_remote_upload(exc):
+        return (
+            "Modal.com's container lost this file's uploaded audio before transcription could "
+            "read it back -- a Modal.com-side issue, not a problem with your file. Try running "
+            "this job again."
+        )
     if isinstance(exc, FileNotFoundError) or "no such file" in lower:
         return "This file could not be found on disk -- it may have been moved or deleted."
     if isinstance(exc, PermissionError) or "permission denied" in lower:
@@ -120,10 +184,10 @@ def _run_single_step(
     whichever step is in flight immediately, rather than waiting for it
     to run to completion."""
     file_info = step["file"]
-    label = _step_label(step, model_name, execution)
+    label = _step_label(step, model_name, execution, formats)
     job.emit({"event": "log", "text": label, "step": step["name"]})
     job.emit({"event": "step_start", "step": step["name"]})
-    if progress_cb is not None and step["name"] in ("Audio Extraction", "Upload audio files to Modal.com", "Transcription"):
+    if progress_cb is not None and step["name"] in ("Audio Extraction", "Upload audio files to Modal.com", "Transcription", "Transcription & Download", "Cleanup - Modal.com Audio Uploads"):
         # Shows "(0%)" the instant the step starts, for both local and
         # Modal execution, instead of leaving the suffix blank until the
         # first real segment/progress event arrives -- which, for Modal
@@ -149,16 +213,22 @@ def _run_single_step(
                 if progress_cb is not None and file_duration_sec > 0:
                     progress_cb(min(1.0, processed_sec / file_duration_sec))
 
+            started = time.perf_counter()
             try:
                 extract_audio(abs_path, wav_path, should_cancel=should_cancel, on_progress=on_extraction_progress)
             except StepCancelled:
                 # ffmpeg may have already written a partial file before
                 # being killed -- record it so the unconditional Cleanup
                 # pass still removes it rather than leaving it orphaned.
+                # Not recorded as a calibration sample: a cancelled
+                # extraction's elapsed time doesn't reflect genuine
+                # full-file throughput.
                 if wav_path.exists():
                     file_state[file_info["path"]]["wav_path"] = wav_path
                 raise
             file_state[file_info["path"]]["wav_path"] = wav_path
+            if file_duration_sec > 0:
+                calibration.record_extraction_sample((time.perf_counter() - started) / (file_duration_sec / 60))
 
         elif step["name"] == "Whisper Model Setup":
             if hf_token:
@@ -187,10 +257,17 @@ def _run_single_step(
             except StepCancelled:
                 # Cancelling still bills for GPU time actually used before
                 # the container was terminated -- same reasoning as the
-                # Transcription branch below.
+                # Transcription branch below. Not recorded as a
+                # calibration sample: a cancelled setup's elapsed time
+                # doesn't reflect genuine full cold-start duration.
                 real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
                 raise
-            real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
+            elapsed = time.perf_counter() - started
+            real_cost = (elapsed / 3600) * _gpu_rate(gpu)
+            # Reuses the same "setup" calibration kind as local Whisper
+            # Model Setup above, keyed by (model, gpu) instead of
+            # (model, "cpu") -- see calibration.py's docstring.
+            calibration.record_setup_sample(model_name, gpu, elapsed)
 
         elif step["name"] == "Upload audio files to Modal.com":
             abs_path = folder_path / file_info["path"]
@@ -227,7 +304,7 @@ def _run_single_step(
             # anything left over is gone once the container is torn down.
             file_state[file_info["path"]]["modal_upload_id"] = upload_id
 
-        elif step["name"] == "Transcription":
+        elif step["name"] in ("Transcription", "Transcription & Download"):
             abs_path = folder_path / file_info["path"]
             wav_path = file_state[file_info["path"]].get("wav_path")
             audio_path = wav_path if wav_path is not None else abs_path
@@ -256,10 +333,41 @@ def _run_single_step(
                     # silently losing track of real Modal spend.
                     real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
                     raise
+                except Exception as exc:
+                    if not _is_missing_remote_upload(exc):
+                        raise
+                    # A long job (uploading dozens of files can itself take
+                    # the better part of an hour before Transcription even
+                    # starts -- see run_job's phase-wise Upload-then-
+                    # Transcribe design) can genuinely outlast Modal.com's
+                    # single container getting replaced partway through --
+                    # max_containers=1 guarantees there's never more than
+                    # one container *at a time*, but not that it's the
+                    # *same* one for the whole job. A file uploaded before
+                    # that replacement has no data on whichever container
+                    # is current now. Recovered here by re-uploading fresh
+                    # to the current container and retrying once, rather
+                    # than failing a file for a Modal.com-side reason that
+                    # has nothing to do with the file itself -- a real,
+                    # reproducible run hit exactly this for 13 of 20 files
+                    # (see logs/ for that run). Retried only once: a second
+                    # loss in a row for the same file is a real failure,
+                    # not silently retried forever.
+                    job.emit({"event": "log", "text": f"Re-uploading and retrying: {file_info['path']} (its uploaded audio was lost)"})
+                    logger.warning("Transcription on %s lost its uploaded audio -- re-uploading and retrying once", file_info["path"])
+                    retry_upload_id = uuid.uuid4().hex
+                    audio_bytes = audio_path.read_bytes()
+                    modal_transcriber.upload(audio_bytes, retry_upload_id, should_cancel=should_cancel)
+                    file_state[file_info["path"]]["modal_upload_id"] = retry_upload_id
+                    raw = modal_transcriber.transcribe(
+                        retry_upload_id, BEAM_SIZE,
+                        should_cancel=should_cancel, on_progress=on_segment_end,
+                    )
                 # Cost is billed on the *full* RPC wall time (incl. cold
-                # start); calibration uses inference_sec alone so a short
-                # clip's cold-start overhead doesn't skew future
-                # throughput estimates for this (model, GPU) pair.
+                # start, and any re-upload+retry above); calibration uses
+                # inference_sec alone so a short clip's cold-start overhead
+                # doesn't skew future throughput estimates for this
+                # (model, GPU) pair.
                 real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
                 segments = [engine.Segment(**s) for s in raw["segments"]]
                 if file_duration_sec > 0:
@@ -275,8 +383,17 @@ def _run_single_step(
                 out_path = abs_path.with_suffix(f".{fmt}")
                 writers.write_format(fmt, segments, out_path)
 
-        elif step["name"] == "Download Transcript to Local":
-            pass  # already covered by the Transcription step's bundled RPC
+        elif step["name"] == "Cleanup - Modal.com Audio Uploads":
+            upload_id = file_state[file_info["path"]]["modal_upload_id"]
+            modal_transcriber.delete_upload(upload_id, should_cancel=should_cancel)
+            # A single delete+commit call has no meaningful partial
+            # progress within itself (unlike Upload/Transcription, which
+            # stream) -- jumps straight to "done" so the batch-wide
+            # blended percent in the Steps table still advances smoothly
+            # file by file, the same mechanism as every other per-file
+            # batch-wide phase.
+            if progress_cb is not None:
+                progress_cb(1.0)
 
         elif step["name"] == "Cleanup - Modal.com Teardown":
             # Explicit, visible teardown of the job's warm container/session
@@ -308,8 +425,28 @@ def _run_single_step(
         return "cancelled", None, real_cost
 
     except Exception as exc:  # noqa: BLE001 -- surfaced to the user as a log line
-        message = _friendly_error(exc)
         who = file_info["path"] if file_info else "job"
+
+        if execution == "modal" and _is_modal_session_dead(exc):
+            # Not this file's fault, and not recoverable by skipping it --
+            # every remaining file would fail the same way. run_job's main
+            # loop turns this into a job-ending fatal_error (dialog) rather
+            # than letting it fail through the rest of the batch one file
+            # at a time. step_cancelled (not step_failed): this phase was
+            # interrupted, not genuinely broken by this file.
+            message = (
+                "Modal.com stopped this job's session -- most often because this computer "
+                "went to sleep or hibernated mid-run, which drops the connection Modal.com "
+                "uses to keep the job's container alive. Stopping here instead of failing "
+                "through the rest of the files one at a time. Keep this computer awake for "
+                "the whole run (see the app's sleep-prevention note) and try again."
+            )
+            job.emit({"event": "log", "text": f"Modal.com session lost while processing {who}.", "fail": True})
+            job.emit({"event": "step_cancelled", "step": step["name"]})
+            logger.error("Modal.com session lost during %s%s: %s", step["name"], f" on {who}" if file_info else "", exc)
+            return "session_lost", message, real_cost
+
+        message = _friendly_error(exc)
         job.emit({"event": "log", "text": f"Failed: {who} — {message}", "fail": True})
         job.emit({"event": "step_failed", "step": step["name"]})
         logger.exception("Failed during %s%s", step["name"], f" on {who}" if file_info else "")
@@ -361,22 +498,29 @@ async def run_job(
     started_at = time.perf_counter()
     cancelled = False
 
-    # Audio Extraction, Upload audio files to Modal.com, and Transcription
-    # all report real per-file progress. Two different audiences want two
-    # different numbers out of that: the scrolling log line is about *this file*,
-    # so it correctly resets to 0% at the start of each new file -- but
-    # the Steps table has one row per phase for the *whole batch*, so its
-    # "(NN%)" should read as one continuous 0->100% sweep across every
-    # file in that phase, not repeatedly reset. batch_progress_done
-    # tracks how many seconds of audio have already been fully accounted
-    # for in each phase (advanced in the main loop below);
-    # batch_progress_total is the fixed denominator for each (only video
-    # files go through Audio Extraction; every file goes through Upload
-    # and Transcription).
+    # Audio Extraction, Upload audio files to Modal.com, Transcription,
+    # and Cleanup - Modal.com Audio Uploads all report real per-file
+    # progress. Two different audiences want two different numbers out of
+    # that: the scrolling log line is about *this file*, so it correctly
+    # resets to 0% at the start of each new file -- but the Steps table
+    # has one row per phase for the *whole batch*, so its "(NN%)" should
+    # read as one continuous 0->100% sweep across every file in that
+    # phase, not repeatedly reset. batch_progress_done tracks how many
+    # seconds of audio have already been fully accounted for in each
+    # phase (advanced in the main loop below); batch_progress_total is
+    # the fixed denominator for each (only video files go through Audio
+    # Extraction; every file goes through the other three).
+    _total_duration = sum(f["duration_sec"] for f in files) or 1.0
     batch_progress_total = {
         "Audio Extraction": sum(f["duration_sec"] for f in files if f["type"] == "video") or 1.0,
-        "Upload audio files to Modal.com": sum(f["duration_sec"] for f in files) or 1.0,
-        "Transcription": sum(f["duration_sec"] for f in files) or 1.0,
+        "Upload audio files to Modal.com": _total_duration,
+        # Both names included unconditionally (harmless if unused) --
+        # whichever one this job's steps actually use depends on
+        # execution mode ("Transcription & Download" for modal,
+        # "Transcription" for local -- see estimator.py's compute_steps).
+        "Transcription": _total_duration,
+        "Transcription & Download": _total_duration,
+        "Cleanup - Modal.com Audio Uploads": _total_duration,
     }
     batch_progress_done = {name: 0.0 for name in batch_progress_total}
 
@@ -438,13 +582,14 @@ async def run_job(
     # good enough to reject an obviously oversized batch before spending
     # any time on Setup or Extraction at all. But it's still an estimate:
     # a video's real extracted WAV size, or a non-WAV audio file's actual
-    # size on disk, can differ from that estimate. This is the
-    # authoritative check on *real* bytes, run once -- right after
-    # Extraction has produced real WAVs (or immediately, if the batch is
-    # audio-only and there's nothing to extract) and before the
-    # expensive Upload/Transcription phases actually start spending
-    # money.
-    upload_size_checked = False
+    # size on disk, can differ from that estimate. This block computes the
+    # *real* total bytes once -- right after Extraction has produced real
+    # WAVs (or immediately, if the batch is audio-only and there's nothing
+    # to extract) -- both to show the Steps table a real "(total size)"
+    # for Audio Extraction once it's done, and (Modal only) as the
+    # authoritative size-limit check before the expensive Upload/
+    # Transcription phases actually start spending money.
+    audio_totals_checked = False
 
     try:
         for phase_pass in main_passes:
@@ -456,26 +601,32 @@ async def run_job(
                 cancelled = True
                 break
 
-            if execution == "modal" and not upload_size_checked and phase_pass["steps"][0]["name"] != "Audio Extraction":
-                upload_size_checked = True
-                real_upload_bytes = 0
+            if not audio_totals_checked and phase_pass["steps"][0]["name"] != "Audio Extraction":
+                audio_totals_checked = True
+                real_audio_bytes = 0
                 for f in files:
                     if f["path"] in failed_files:
-                        continue  # never reaches Upload, doesn't count
+                        continue  # never reaches Upload/Transcription, doesn't count
                     real_path = file_state.get(f["path"], {}).get("wav_path") or (folder / f["path"])
                     try:
-                        real_upload_bytes += real_path.stat().st_size
+                        real_audio_bytes += real_path.stat().st_size
                     except OSError:
                         pass  # best-effort -- a missing file fails its own step later anyway
-                if real_upload_bytes > MAX_MODAL_UPLOAD_BYTES:
+                # Shown by the frontend as the Audio Extraction row's suffix
+                # once its own "(NN%)" has disappeared -- the total size of
+                # what's actually about to be uploaded/transcribed, for
+                # both local and Modal execution alike.
+                job.emit({"event": "audio_extraction_summary", "total_bytes": real_audio_bytes})
+
+                if execution == "modal" and real_audio_bytes > MAX_MODAL_UPLOAD_BYTES:
                     message = (
-                        f"Selected files need to upload about {real_upload_bytes / 1_000_000_000:.0f} GB to "
+                        f"Selected files need to upload about {real_audio_bytes / 1_000_000_000:.0f} GB to "
                         f"Modal.com, which exceeds the {MAX_MODAL_UPLOAD_BYTES / 1_000_000_000:.0f} GB limit "
                         "for a single job. Cancelling -- select fewer files, or switch to Local execution."
                     )
                     job.emit({"event": "log", "text": message, "fail": True})
                     job.emit({"event": "fatal_error", "text": message})
-                    logger.info("Job %s aborted: real upload size %d bytes exceeds limit", job.id, real_upload_bytes)
+                    logger.info("Job %s aborted: real upload size %d bytes exceeds limit", job.id, real_audio_bytes)
                     cancelled = True
                     break
 
@@ -507,11 +658,13 @@ async def run_job(
                 )
                 total_cost += cost
                 elapsed_estimated += step["sec"]
-                if step["name"] in batch_progress_done and file_info is not None and outcome != "cancelled":
+                if step["name"] in batch_progress_done and file_info is not None and outcome not in ("cancelled", "session_lost"):
                     # Counts toward the blended batch-wide percent above
                     # whether this file's step succeeded or failed --
                     # either way the pipeline is past it, so it should no
-                    # longer hold back the batch-wide percentage.
+                    # longer hold back the batch-wide percentage. Excludes
+                    # "cancelled"/"session_lost" -- the job is being
+                    # abandoned, not genuinely progressing past this file.
                     batch_progress_done[step["name"]] += file_info["duration_sec"]
                 _emit_progress()
 
@@ -526,6 +679,18 @@ async def run_job(
                 elif outcome == "failed":
                     if file_info is not None:
                         failed_files[file_info["path"]] = err
+                elif outcome == "session_lost":
+                    # Modal.com tore down the job's whole session (see
+                    # _is_modal_session_dead's docstring -- typically this
+                    # machine sleeping/hibernating mid-run). Every
+                    # remaining file would fail the same way, so this ends
+                    # the job here (as a fatal_error dialog, not a per-file
+                    # failure) rather than burning through the rest of the
+                    # batch one doomed file at a time.
+                    job.emit({"event": "fatal_error", "text": err})
+                    logger.info("Job %s aborted: Modal.com session lost", job.id)
+                    cancelled = True
+                    break
                 else:  # "cancelled" -- the step noticed the cancel flag and stopped itself mid-flight
                     job.emit({"event": "log", "text": "Cancelled — remaining files/phases were not started."})
                     logger.info("Job %s cancelled mid-step during pass %d", job.id, phase_pass["pass"])
@@ -639,7 +804,14 @@ async def run_job_safe(job: Job, *args, **kwargs) -> None:
     blocks) leaves the job's SSE stream open with nothing more ever
     arriving -- the frontend just sits there spinning forever with no
     indication anything went wrong. This ensures the job always ends
-    with a "done" event and a clear log line, however it fails."""
+    with a "done" event and a clear log line, however it fails.
+
+    Also brackets the whole job with sleep_guard.prevent_sleep()/
+    allow_sleep() -- this is the one place every job (local or Modal,
+    success or failure or cancellation) always passes through exactly
+    once, so it's the right spot to hold the sleep-prevention request for
+    the run's full duration without ever leaking it past the job's end."""
+    sleep_guard.prevent_sleep()
     try:
         await run_job(job, *args, **kwargs)
     except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
@@ -659,3 +831,5 @@ async def run_job_safe(job: Job, *args, **kwargs) -> None:
             "per_minute_sec": 0.0,
             "per_minute_cost": 0.0,
         })
+    finally:
+        sleep_guard.allow_sleep()

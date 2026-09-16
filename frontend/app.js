@@ -656,6 +656,7 @@ const beginRow = document.getElementById("begin-row");
 const beginBtn = document.getElementById("begin-btn");
 const runStep = document.getElementById("run-step");
 const progressBar = document.getElementById("progress-bar");
+const progressPercentLabel = document.getElementById("progress-percent-label");
 const cancelBtn = document.getElementById("cancel-btn");
 const logBox = document.getElementById("log-box");
 const diagnosticsStep = document.getElementById("diagnostics-step");
@@ -684,6 +685,43 @@ function hideFatalErrorDialog() {
 fatalErrorOkBtn.addEventListener("click", hideFatalErrorDialog);
 fatalErrorCancelBtn.addEventListener("click", hideFatalErrorDialog);
 
+// Shows which job is running, above the progress bar -- so it can be
+// matched against its server-side log file (named "<timestamp>_<job id
+// prefix>.jsonl" under logs/) if it fails and needs investigating,
+// without having to dig through server logs to find the id themselves.
+const runJobIdDisplay = document.getElementById("run-job-id-display");
+const runJobIdText = document.getElementById("run-job-id-text");
+const runCopyJobIdBtn = document.getElementById("run-copy-job-id-btn");
+
+function hideJobIdDisplay() {
+  runJobIdDisplay.hidden = true;
+  runJobIdText.textContent = "";
+}
+
+function showJobIdDisplay(jobId) {
+  runJobIdText.textContent = jobId;
+  runJobIdDisplay.hidden = false;
+}
+
+let copyJobIdResetTimer = null;
+
+runCopyJobIdBtn.addEventListener("click", async () => {
+  const id = runJobIdText.textContent;
+  if (!id) return;
+  try {
+    await navigator.clipboard.writeText(id);
+  } catch (e) {
+    return; // clipboard API unavailable/denied -- nothing more we can do
+  }
+  runCopyJobIdBtn.classList.add("copied");
+  runCopyJobIdBtn.title = "Copied!";
+  clearTimeout(copyJobIdResetTimer);
+  copyJobIdResetTimer = setTimeout(() => {
+    runCopyJobIdBtn.classList.remove("copied");
+    runCopyJobIdBtn.title = "Copy job ID";
+  }, 1500);
+});
+
 function invalidatePreview() {
   // Begin only ever appears right after a fresh Preview -- any change to
   // selection/options hides both the estimate panel and Begin again.
@@ -696,6 +734,7 @@ function resetRunAndDiagnostics() {
   diagnosticsStep.hidden = true;
   logBox.innerHTML = "";
   progressBar.value = 0;
+  progressPercentLabel.textContent = "0%";
   diagnosticsTableBody.innerHTML = "";
   cancelBtn.disabled = false;
   cancelBtn.textContent = "Cancel";
@@ -715,8 +754,8 @@ function computeExpectedPhaseCounts(files, execution, cleanup) {
     if (f.type === "video") bump("Audio Extraction");
     if (i === 0) bump(execution === "modal" ? "Modal.com Setup & Model Install" : "Whisper Model Setup");
     if (execution === "modal") bump("Upload audio files to Modal.com");
-    bump("Transcription");
-    if (execution === "modal") bump("Download Transcript to Local");
+    bump(execution === "modal" ? "Transcription & Download" : "Transcription");
+    if (execution === "modal") bump("Cleanup - Modal.com Audio Uploads");
     if (i === 0) bump(execution === "modal" ? "Cleanup - Modal.com Teardown" : "Cleanup - Release Whisper Model");
     if (cleanup && f.type === "video") bump("Cleanup - Intermediate Files");
   });
@@ -730,14 +769,55 @@ function setPhaseIcon(phaseName, state) {
   el.textContent = state === "done" ? "✓" : state === "failed" ? "✗" : state === "warning" ? "!" : "";
 }
 
-// Only the Transcription row ever gets a non-empty suffix (see
-// step_progress handling below) -- shows live progress while it runs,
-// clears on a clean finish, but is deliberately left in place if the
-// step was interrupted (failed/skipped/cancelled) so the row keeps
-// showing exactly how far it got.
+// Shows live progress while a phase runs, clears on a clean finish, but
+// is deliberately left in place if the phase was interrupted (a file
+// failed/skipped/cancelled) so the row keeps showing exactly how far it
+// got.
 function setStepProgressSuffix(phaseName, text) {
   const el = previewTableBody.querySelector(`.step-progress-suffix[data-phase="${phaseName}"]`);
   if (el) el.textContent = text;
+}
+
+// Batch-wide "(NN%)" text per phase, set from step_progress events --
+// kept separate from the file-count suffix below so the two can be
+// combined/recombined independently as either one changes.
+let stepPercentText = {};
+
+// These phases process every file individually within the phase (unlike
+// Audio Extraction, whose row shows a total size once done -- see the
+// audio_extraction_summary handler below) -- while the phase is running,
+// its row also shows "done / total" files, e.g. "5 / 10".
+const FILE_COUNT_SUFFIX_PHASES = new Set([
+  "Upload audio files to Modal.com",
+  "Transcription",
+  "Transcription & Download",
+  "Cleanup - Modal.com Audio Uploads",
+]);
+
+function fileCountSuffixText(phaseName) {
+  const st = phaseStatus[phaseName];
+  if (!st || !FILE_COUNT_SUFFIX_PHASES.has(phaseName)) return "";
+  const accountedFor = st.doneCount + st.failedCount + st.skippedCount + st.cancelledCount;
+  return ` ${accountedFor} / ${st.expectedCount}`;
+}
+
+// Recombines and (re)renders a phase row's suffix from its latest known
+// percent text and file-count text -- called any time either input
+// changes (a step_progress event, or a file finishing the phase).
+function updateStepSuffix(phaseName) {
+  setStepProgressSuffix(phaseName, (stepPercentText[phaseName] || "") + fileCountSuffixText(phaseName));
+}
+
+// True once every file has cleanly finished this phase -- no failures or
+// cancellations at all. Mirrors paintPhaseFromCounts' criteria for a
+// green "done" icon; used to decide whether a phase's suffix should be
+// cleared (clean finish) or left in place (interrupted, as a record of
+// how far it got).
+function isPhaseCleanlyDone(phaseName) {
+  const st = phaseStatus[phaseName];
+  if (!st) return false;
+  const accountedFor = st.doneCount + st.failedCount + st.skippedCount + st.cancelledCount;
+  return accountedFor >= st.expectedCount && st.failedCount === 0 && st.cancelledCount === 0 && st.doneCount > 0;
 }
 
 // Paints a phase's icon from its counts so far -- green only if nothing
@@ -891,19 +971,27 @@ beginBtn.addEventListener("click", async () => {
   diagnosticsStep.hidden = true;
   logBox.innerHTML = "";
   progressBar.value = 0;
+  progressPercentLabel.textContent = "0%";
   cancelBtn.disabled = false;
   cancelBtn.textContent = "Cancel";
   beginBtn.disabled = true;
   hideFatalErrorDialog();
+  hideJobIdDisplay();
 
   const req = buildTranscribeRequest();
   const expected = computeExpectedPhaseCounts(req.files, req.execution, req.cleanup);
   phaseStatus = {};
+  stepPercentText = {};
   for (const [name, expectedCount] of Object.entries(expected)) {
     phaseStatus[name] = { doneCount: 0, failedCount: 0, skippedCount: 0, cancelledCount: 0, expectedCount };
     setPhaseIcon(name, null); // clear any icon left from a previous run
-    setStepProgressSuffix(name, ""); // clear any "(NN%)" left from a previous run
   }
+  // Clears every phase row's suffix, not just phases this run actually
+  // expects -- e.g. a previous video-heavy run's Audio Extraction total
+  // size, or a previous Modal run's Upload "done / total" count, must not
+  // linger into a run (audio-only, or Local) where that row still exists
+  // in the table but nothing will ever update it again.
+  previewTableBody.querySelectorAll(".step-progress-suffix").forEach((el) => { el.textContent = ""; });
   activeProgressStep = null;
   activeProgressLine = null;
   activeProgressBaseText = "";
@@ -920,6 +1008,7 @@ beginBtn.addEventListener("click", async () => {
     }
     const { job_id } = await res.json();
     activeJobId = job_id;
+    showJobIdDisplay(job_id);
 
     const es = new EventSource(`/api/jobs/${job_id}/stream`);
     activeEventSource = es;
@@ -938,18 +1027,26 @@ beginBtn.addEventListener("click", async () => {
         // this additionally surfaces it as a dialog over the page, since
         // it means the whole job is being abandoned, not just one file.
         showFatalErrorDialog(event.text);
+      } else if (event.event === "audio_extraction_summary") {
+        // Fires once, right after the whole Audio Extraction phase has
+        // finished (or immediately, for an audio-only batch that never
+        // extracted anything) -- replaces that row's now-cleared "(NN%)"
+        // with the real total size of what's actually about to be
+        // uploaded/transcribed.
+        stepPercentText["Audio Extraction"] = ` (${formatBytes(event.total_bytes)})`;
+        updateStepSuffix("Audio Extraction");
       } else if (event.event === "step_progress") {
-        // step_progress only ever arrives for Audio Extraction and
-        // Transcription (see pipeline.py), so no name check is needed
-        // here. Two different numbers for two different audiences: the
-        // Steps table has one row per phase for the *whole batch*, so it
-        // shows batch_percent (a continuous 0->100% sweep across every
-        // file in that phase); the scrolling log is file-by-file, so its
-        // line shows percent (this file only, correctly resetting to 0%
-        // per file) -- and only updates if it's still the most recently
-        // logged step (guards against a stray late event after the
-        // pipeline has already moved on).
-        setStepProgressSuffix(event.step, ` (${event.batch_percent}%)`);
+        // step_progress arrives for Audio Extraction, Upload, and
+        // Transcription (see pipeline.py). Two different numbers for two
+        // different audiences: the Steps table has one row per phase for
+        // the *whole batch*, so it shows batch_percent (a continuous
+        // 0->100% sweep across every file in that phase); the scrolling
+        // log is file-by-file, so its line shows percent (this file only,
+        // correctly resetting to 0% per file) -- and only updates if it's
+        // still the most recently logged step (guards against a stray
+        // late event after the pipeline has already moved on).
+        stepPercentText[event.step] = ` (${event.batch_percent}%)`;
+        updateStepSuffix(event.step);
         if (event.step === activeProgressStep && activeProgressLine) {
           activeProgressLine.textContent = `${activeProgressBaseText} (${event.percent}%)`;
         }
@@ -958,17 +1055,31 @@ beginBtn.addEventListener("click", async () => {
         if (st && st.doneCount + st.failedCount + st.skippedCount + st.cancelledCount < st.expectedCount) {
           setPhaseIcon(event.step, "spinner");
         }
+        // Shows "0 / N" the instant the phase starts, for Download
+        // Transcript to Local in particular -- it never gets a
+        // step_progress event of its own (it has nothing to report
+        // progress on), so without this its file-count suffix would only
+        // ever appear starting from its *second* file.
+        updateStepSuffix(event.step);
       } else if (event.event === "step_done") {
         const st = phaseStatus[event.step];
         if (st) {
           st.doneCount++;
           finalizePhaseIfComplete(event.step);
         }
-        // A clean finish doesn't need the percent anymore -- only an
-        // interrupted step (failed/cancelled below) keeps it, as a
-        // record of how far it got. Harmless no-op for phases that never
-        // had a suffix to begin with.
-        setStepProgressSuffix(event.step, "");
+        // A clean finish across every file in the phase doesn't need the
+        // suffix anymore -- only a phase interrupted by a failure/
+        // cancellation (below) keeps it, as a record of how far it got.
+        // Still short of every file, though: update in place (advances
+        // the "done / total" count) rather than clearing, so the row
+        // doesn't flicker blank between one file finishing and the next
+        // one's progress arriving.
+        if (isPhaseCleanlyDone(event.step)) {
+          stepPercentText[event.step] = "";
+          setStepProgressSuffix(event.step, "");
+        } else {
+          updateStepSuffix(event.step);
+        }
         if (event.step === activeProgressStep) activeProgressLine = null;
       } else if (event.event === "step_failed") {
         const st = phaseStatus[event.step];
@@ -976,6 +1087,7 @@ beginBtn.addEventListener("click", async () => {
           st.failedCount++;
           finalizePhaseIfComplete(event.step);
         }
+        updateStepSuffix(event.step); // advances "done / total"; retained, never cleared
         if (event.step === activeProgressStep) activeProgressLine = null;
       } else if (event.event === "step_cancelled") {
         // This phase was itself interrupted mid-flight for this file --
@@ -989,6 +1101,7 @@ beginBtn.addEventListener("click", async () => {
           st.cancelledCount++;
           finalizePhaseIfComplete(event.step);
         }
+        updateStepSuffix(event.step);
         if (event.step === activeProgressStep) activeProgressLine = null;
       } else if (event.event === "step_skipped") {
         const st = phaseStatus[event.step];
@@ -996,9 +1109,11 @@ beginBtn.addEventListener("click", async () => {
           st.skippedCount++;
           finalizePhaseIfComplete(event.step);
         }
+        updateStepSuffix(event.step);
         if (event.step === activeProgressStep) activeProgressLine = null;
       } else if (event.event === "progress") {
         progressBar.value = event.percent;
+        progressPercentLabel.textContent = `${event.percent}%`;
       } else if (event.event === "done") {
         es.close();
         activeEventSource = null;

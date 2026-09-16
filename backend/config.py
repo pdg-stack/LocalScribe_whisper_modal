@@ -49,8 +49,17 @@ GPU_SPEED_MULTIPLIER = {
     "H100": 3.8,
 }
 
-MODAL_SETUP_SEC = 20  # cold start: spin instance + install/load model
-MODAL_DOWNLOAD_SEC = 2  # transcript result back to local
+MODAL_SETUP_SEC = 20  # cold start: spin instance + install/load model -- fallback only; see calibration.py
+MODAL_AUDIO_CLEANUP_SEC = 2  # delete + commit one file's audio off AUDIO_UPLOAD_VOLUME
+
+# ffmpeg audio-extraction time, in seconds per minute of source media --
+# fallback only, before any real samples exist (extraction is fast: no
+# video re-encoding, just demuxing + decoding + writing WAV, so real
+# observed throughput on real hardware has been under a tenth of this).
+# backend/calibration.py prefers actually-measured throughput from
+# completed jobs once available, same self-correcting mechanism as the
+# RTF/setup/upload estimates above.
+AUDIO_EXTRACTION_SEC_PER_MIN = 2.0
 
 # The extracted WAV's fixed bitrate (16kHz, mono, 16-bit -- matches
 # ffmpeg_utils.extract_audio's output format exactly), used to estimate

@@ -152,8 +152,15 @@
 
     <!-- Run step -->
     <section class="card" id="run-step" hidden>
+      <p id="run-job-id-display" class="job-id-display hint" hidden>
+        Job ID: <code id="run-job-id-text"></code>
+        <button type="button" id="run-copy-job-id-btn" class="copy-btn" aria-label="Copy job ID" title="Copy job ID">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+      </p>
       <div class="progress-row">
         <progress id="progress-bar" max="100" value="0"></progress>
+        <span id="progress-percent-label" class="hint">0%</span>
         <button id="cancel-btn" class="btn btn-danger">Cancel</button>
       </div>
       <div class="log-box" id="log-box"></div>
