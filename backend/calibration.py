@@ -9,12 +9,19 @@ accurate the more a given (model, device) combination is actually used,
 and reflect this machine/account's real performance rather than someone
 else's benchmark.
 
-Three kinds of value are tracked, as a running average:
+Four kinds of value are tracked, as a running average:
 - "rtf" -- transcription real-time-factor (seconds of processing per
   second of audio), keyed by (model, device), used to scale with file
   duration.
 - "setup" -- one-time model load/install duration in seconds (roughly
-  constant regardless of audio length), keyed by (model, device).
+  constant regardless of audio length), keyed by (model, device) --
+  "device" is "cpu" for local setup, or the GPU id (e.g. "L4") for
+  Modal.com's "Modal.com Setup & Model Install" step, since both a
+  bigger model and a different GPU change cold-start time.
+- "extraction" -- ffmpeg audio-extraction throughput, in seconds of
+  extraction time per minute of source media. Not keyed by model/device
+  (ffmpeg's speed depends on this machine's CPU, not on the Whisper
+  model or execution mode) -- uses a single fixed key instead.
 - "upload" -- measured Modal.com upload throughput in bytes/sec. Not
   keyed by model/device (upload speed is a property of this machine's
   network connection, not the Whisper model or GPU) -- uses a single
@@ -103,3 +110,11 @@ def get_upload_bytes_per_sec() -> float | None:
 
 def record_upload_sample(bytes_per_sec: float) -> None:
     _record("upload", "_", "_", bytes_per_sec)
+
+
+def get_extraction_sec_per_min() -> float | None:
+    return _get("extraction", "_", "_")
+
+
+def record_extraction_sample(sec_per_min: float) -> None:
+    _record("extraction", "_", "_", sec_per_min)

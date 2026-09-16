@@ -6,15 +6,17 @@ progress bar.
 
 from __future__ import annotations
 
+from backend.calibration import get_extraction_sec_per_min as get_calibrated_extraction_sec_per_min
 from backend.calibration import get_rtf as get_calibrated_rtf
 from backend.calibration import get_setup_sec as get_calibrated_setup_sec
 from backend.calibration import get_upload_bytes_per_sec as get_calibrated_upload_bytes_per_sec
 from backend.config import (
+    AUDIO_EXTRACTION_SEC_PER_MIN,
     GPU_OPTIONS,
     GPU_SPEED_MULTIPLIER,
     LOCAL_MODEL_SETUP_SEC,
     MAX_MODAL_UPLOAD_BYTES,
-    MODAL_DOWNLOAD_SEC,
+    MODAL_AUDIO_CLEANUP_SEC,
     MODAL_SETUP_SEC,
     MODAL_UPLOAD_BYTES_PER_SEC,
     RTF_LOCAL_CPU,
@@ -41,8 +43,8 @@ PHASE_ORDER_MODAL = [
     "Audio Extraction",
     "Modal.com Setup & Model Install",
     "Upload audio files to Modal.com",
-    "Transcription",
-    "Download Transcript to Local",
+    "Transcription & Download",
+    "Cleanup - Modal.com Audio Uploads",
     "Cleanup - Modal.com Teardown",
     "Cleanup - Intermediate Files",
 ]
@@ -77,6 +79,26 @@ def _estimate_local_setup_sec(model: str) -> float:
     return calibrated if calibrated is not None else LOCAL_MODEL_SETUP_SEC[model]
 
 
+def _estimate_modal_setup_sec(model: str, gpu_id: str | None) -> float:
+    """Prefers real measured Modal.com cold-start time for this exact
+    (model, GPU) pair once we've actually run it before -- both a bigger
+    model and a different GPU change how long the container takes to
+    start and load weights, same reasoning as _estimate_local_setup_sec
+    above for the local path."""
+    calibrated = get_calibrated_setup_sec(model, gpu_id) if gpu_id else None
+    return calibrated if calibrated is not None else MODAL_SETUP_SEC
+
+
+def _estimate_extraction_sec_per_min() -> float:
+    """Prefers this machine's own real measured ffmpeg extraction
+    throughput (recorded in pipeline.py after each Audio Extraction step
+    completes) once at least one sample exists; otherwise falls back to
+    the static conservative guess -- same self-correcting pattern as
+    _estimate_rtf/_estimate_upload_bytes_per_sec above."""
+    calibrated = get_calibrated_extraction_sec_per_min()
+    return calibrated if calibrated is not None else AUDIO_EXTRACTION_SEC_PER_MIN
+
+
 def _estimate_upload_bytes_per_sec() -> float:
     """Prefers this machine's own real measured Modal.com upload
     throughput (recorded in pipeline.py after each Upload step
@@ -105,13 +127,14 @@ def compute_steps(
     is_modal = execution == "modal"
     rtf = _estimate_rtf(model, execution, gpu_id)
     rate = _gpu_rate(gpu_id) if is_modal else 0.0
+    extraction_sec_per_min = _estimate_extraction_sec_per_min()
 
     steps: list[dict] = []
 
     # Pass 0: Audio Extraction -- every video file, independent of the rest.
     for f in files:
         if f["type"] == "video":
-            steps.append({"file": f, "name": "Audio Extraction", "pass": 0, "sec": (f["duration_sec"] / 60) * 2, "cost": 0.0})
+            steps.append({"file": f, "name": "Audio Extraction", "pass": 0, "sec": (f["duration_sec"] / 60) * extraction_sec_per_min, "cost": 0.0})
 
     next_pass = 1
     # Pass 1: Model Setup -- once for the whole job, not per file. Local
@@ -121,9 +144,10 @@ def compute_steps(
     # ModalTranscriber), so its cold start is likewise a single job-level
     # cost rather than something every file pays again.
     if is_modal:
+        modal_setup_sec = _estimate_modal_setup_sec(model, gpu_id)
         steps.append({
             "file": None, "name": "Modal.com Setup & Model Install", "pass": next_pass,
-            "sec": MODAL_SETUP_SEC, "cost": (MODAL_SETUP_SEC / 3600) * rate,
+            "sec": modal_setup_sec, "cost": (modal_setup_sec / 3600) * rate,
         })
     else:
         steps.append({"file": None, "name": "Whisper Model Setup", "pass": next_pass, "sec": _estimate_local_setup_sec(model), "cost": 0.0})
@@ -161,25 +185,44 @@ def compute_steps(
 
     # Pass 3: Transcription for every file -- kept as one contiguous pass
     # so every file's Transcription genuinely finishes, in the real
-    # execution order, before any file's Download phase starts. When they
+    # execution order, before any file's Cleanup phase starts. When they
     # were interleaved per file, the two showed as running at once with
     # nothing to explain why.
+    #
+    # Modal's version of this phase is named "Transcription & Download",
+    # not plain "Transcription" -- unlike the local path, where the model
+    # just runs in-process, Modal's transcribe() RPC call bundles both:
+    # the returned segments are the "download" (a few KB of text, handed
+    # back in the same call, not a separate transfer), so there never was
+    # a genuinely separate "Download Transcript to Local" phase to give
+    # its own row to -- it used to exist purely as a formality line item,
+    # doing nothing (see pipeline.py's history) once every Transcription
+    # call already returns the finished text. Removed rather than kept
+    # as a no-op, now that the combined name says so directly.
     for f in files:
         transcription_sec = f["duration_sec"] * rtf
         steps.append({
-            "file": f, "name": "Transcription", "pass": next_pass,
+            "file": f, "name": "Transcription & Download" if is_modal else "Transcription", "pass": next_pass,
             "sec": transcription_sec, "cost": (transcription_sec / 3600) * rate if is_modal else 0.0,
         })
     next_pass += 1
 
-    # Pass 4 (Modal only): Download Transcript to Local -- a formality by
-    # this point (the transcript is already written to disk as part of
-    # Transcription above); kept as its own pass purely for the time/cost
-    # line item, and so it's only ever shown starting once every file's
-    # Transcription has actually finished.
+    # Pass 4 (Modal only): Cleanup - Modal.com Audio Uploads -- deletes
+    # each file's audio off AUDIO_UPLOAD_VOLUME once Transcription &
+    # Download is done reading it. Always runs (unlike
+    # Cleanup - Intermediate Files below, which is the *local* WAV and
+    # only runs if the user opted into it) -- this Volume is shared,
+    # persistent storage across every job ever run, not a per-job scratch
+    # space that disappears on its own, so leaving it behind isn't a
+    # preference, it's a leak. Kept as its own pass, before the
+    # container itself is torn down below, since a per-file delete call
+    # needs the session/container still active.
     if is_modal:
         for f in files:
-            steps.append({"file": f, "name": "Download Transcript to Local", "pass": next_pass, "sec": MODAL_DOWNLOAD_SEC, "cost": 0.0})
+            steps.append({
+                "file": f, "name": "Cleanup - Modal.com Audio Uploads", "pass": next_pass,
+                "sec": MODAL_AUDIO_CLEANUP_SEC, "cost": 0.0,
+            })
         next_pass += 1
 
     # Pass N: Release Resources -- always runs, unlike the Cleanup pass
