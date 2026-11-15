@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 
 from faster_whisper import WhisperModel
+from faster_whisper.audio import decode_audio
 
-from backend.config import BEAM_SIZE
+from backend.config import LOCAL_MODEL_DIR, build_decode_options
 from backend.jobs import StepCancelled
 
 _model_cache: dict[tuple[str, str], WhisperModel] = {}
@@ -32,6 +33,27 @@ class Segment(NamedTuple):
     text: str
 
 
+class TranscriptionInfo(NamedTuple):
+    """What Whisper actually used for a file -- surfaced so a wrong
+    language detection is visible in the log instead of silent."""
+    language: str  # language the output was decoded in
+    language_probability: float
+    duration: float
+    # The audio's real spoken language, ALWAYS auto-detected, independent
+    # of the output language/script the user picked.
+    detected_language: str
+    detected_probability: float
+
+
+def _load_model(model_name: str, device: str) -> WhisperModel:
+    # download_root pins weights to LOCAL_MODEL_DIR so they're downloaded
+    # once and survive restarts (instead of wherever the default HF cache
+    # happens to be).
+    LOCAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    compute_type = "int8" if device == "cpu" else "float16"
+    return WhisperModel(model_name, device=device, compute_type=compute_type, download_root=str(LOCAL_MODEL_DIR))
+
+
 def get_model(model_name: str, device: str = "cpu") -> WhisperModel:
     """Returns the cached model, creating it if needed, without touching
     the reference count -- used by Transcription, which relies on the
@@ -40,8 +62,7 @@ def get_model(model_name: str, device: str = "cpu") -> WhisperModel:
     key = (model_name, device)
     with _lock:
         if key not in _model_cache:
-            compute_type = "int8" if device == "cpu" else "float16"
-            _model_cache[key] = WhisperModel(model_name, device=device, compute_type=compute_type)
+            _model_cache[key] = _load_model(model_name, device)
         return _model_cache[key]
 
 
@@ -53,8 +74,7 @@ def acquire_model(model_name: str, device: str = "cpu") -> WhisperModel:
     key = (model_name, device)
     with _lock:
         if key not in _model_cache:
-            compute_type = "int8" if device == "cpu" else "float16"
-            _model_cache[key] = WhisperModel(model_name, device=device, compute_type=compute_type)
+            _model_cache[key] = _load_model(model_name, device)
         _model_refcount[key] = _model_refcount.get(key, 0) + 1
         return _model_cache[key]
 
@@ -80,7 +100,9 @@ def transcribe(
     audio_path: Path,
     should_cancel: Callable[[], bool] | None = None,
     on_progress: Callable[[float], None] | None = None,
-) -> list[Segment]:
+    language: str = "en",
+    translate: bool = False,
+) -> tuple[list[Segment], TranscriptionInfo]:
     """model.transcribe() returns a lazily-computed generator -- each
     segment is only decoded when we ask for the next one -- so checking
     should_cancel() between segments stops the job as soon as the segment
@@ -91,7 +113,14 @@ def transcribe(
     end timestamp (seconds into the audio) as segments are decoded, so the
     caller can report real progress through a step that can otherwise run
     for a very long time before anything else happens."""
-    segments, _info = model.transcribe(str(audio_path), beam_size=BEAM_SIZE)
+    # Decoded once and shared by detection + transcription. Detection
+    # always runs on the real audio (VAD-filtered, up to 4 windows) so the
+    # true source language is known even when the output script is forced.
+    audio = decode_audio(str(audio_path), sampling_rate=16000)
+    det_lang, det_prob, _ = model.detect_language(
+        audio, vad_filter=True, language_detection_segments=4, language_detection_threshold=0.5,
+    )
+    segments, info = model.transcribe(audio, **build_decode_options(language, translate))
     result = []
     for s in segments:
         if should_cancel is not None and should_cancel():
@@ -99,4 +128,4 @@ def transcribe(
         result.append(Segment(start=s.start, end=s.end, text=s.text.strip()))
         if on_progress is not None:
             on_progress(s.end)
-    return result
+    return result, TranscriptionInfo(info.language, info.language_probability, info.duration, det_lang, det_prob)

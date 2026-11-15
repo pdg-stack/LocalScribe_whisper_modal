@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend.config import (
+    AUTO_LANGUAGE, DEFAULT_LANGUAGE, TRANSLATE_UNSUPPORTED_MODELS, WHISPER_LANGUAGES,
+    validate_language_options,
+)
 from backend.estimator import UploadSizeExceededError, aggregate_phases, compute_steps
 from backend.ffmpeg_utils import FfmpegNotFoundError
 from backend.jobs import create_job, get_job, request_cancel
@@ -21,6 +27,8 @@ from backend.system_info import get_local_resources
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 PREFS_PATH = PROJECT_ROOT / "user_prefs.json"
+
+_prefs_lock = threading.Lock()
 
 app = FastAPI(title="LocalScribe_whisper_modal")
 
@@ -79,14 +87,28 @@ def save_preferences(prefs: PreferencesModel):
     # frontend's way of saying "the field was cleared") actually clears
     # it, instead of the old value silently surviving forever because a
     # merge can never overwrite anything with a filtered-out None.
-    existing = {}
-    if PREFS_PATH.exists():
-        try:
-            existing = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            existing = {}
-    existing.update(prefs.model_dump(exclude_unset=True))
-    PREFS_PATH.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    #
+    # Serialized by a lock and written atomically (temp file + replace):
+    # the page fires several saves at once, and without this one request
+    # could read the file while another was mid-write, see it as empty,
+    # and write back only its own fields -- silently erasing everything
+    # else (tokens, folder history). An unreadable file is therefore never
+    # treated as "empty": the save is refused so nothing gets overwritten.
+    with _prefs_lock:
+        existing = {}
+        if PREFS_PATH.exists():
+            try:
+                existing = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                raise HTTPException(
+                    status_code=500,
+                    detail="user_prefs.json could not be read, so nothing was saved (to avoid overwriting it). "
+                           "Fix or restore the file and try again.",
+                )
+        existing.update(prefs.model_dump(exclude_unset=True))
+        tmp_path = PREFS_PATH.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        os.replace(tmp_path, PREFS_PATH)
     return existing
 
 
@@ -115,10 +137,26 @@ def api_local_resources():
     return get_local_resources()
 
 
+@app.get("/api/language-options")
+def api_language_options():
+    # Single source of truth for the Options step's language dropdown and
+    # the translate checkbox's disabled-model list (see config.py).
+    return {
+        "default": DEFAULT_LANGUAGE,
+        "auto": AUTO_LANGUAGE,
+        "languages": [{"code": c, "name": n} for c, n in sorted(WHISPER_LANGUAGES.items(), key=lambda kv: kv[1])],
+        "translate_unsupported_models": sorted(TRANSLATE_UNSUPPORTED_MODELS),
+    }
+
+
 @app.post("/api/preview")
 def api_preview(req: PreviewRequest):
     if req.execution == "modal" and not req.gpu:
         raise HTTPException(status_code=400, detail="GPU type is required for Modal.com execution.")
+    try:
+        validate_language_options(req.model, req.language, req.translate)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     files = [f.model_dump() for f in req.files]
     try:
         steps = compute_steps(files, req.model, req.execution, req.gpu, req.cleanup)
@@ -134,6 +172,10 @@ def api_preview(req: PreviewRequest):
 async def api_transcribe(req: TranscribeRequest):
     if req.execution == "modal" and not (req.modal_token_id and req.modal_token_secret):
         raise HTTPException(status_code=400, detail="Modal Token ID and Token Secret are required for Modal.com execution.")
+    try:
+        validate_language_options(req.model, req.language, req.translate)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     files = [f.model_dump() for f in req.files]
     try:
         # Defense in depth -- Begin never appears without a successful
@@ -146,6 +188,7 @@ async def api_transcribe(req: TranscribeRequest):
     asyncio.create_task(run_job_safe(
         job, req.folder_path, files, req.model, req.formats, req.execution, req.gpu, req.cleanup,
         req.modal_token_id, req.modal_token_secret, req.hf_token,
+        req.language, req.translate,
     ))
     return {"job_id": job.id}
 

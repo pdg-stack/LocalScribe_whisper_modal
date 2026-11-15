@@ -14,3 +14,6 @@ rtf_calibration.json
 # Editor
 .vscode/
 .idea/
+
+# Downloaded Whisper weights (local execution)
+models/

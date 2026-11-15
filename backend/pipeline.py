@@ -28,7 +28,7 @@ from typing import Callable
 import modal.exception
 
 from backend import calibration, sleep_guard
-from backend.config import BEAM_SIZE, GPU_OPTIONS, MAX_MODAL_UPLOAD_BYTES
+from backend.config import AUTO_LANGUAGE, GPU_OPTIONS, MAX_MODAL_UPLOAD_BYTES, WHISPER_LANGUAGES, build_decode_options
 from backend.estimator import aggregate_phases, compute_steps
 from backend.ffmpeg_utils import FfmpegNotFoundError, extract_audio
 from backend.jobs import Job, StepCancelled
@@ -172,6 +172,8 @@ def _run_single_step(
     logger: logging.Logger,
     file_state: dict,
     progress_cb: Callable[[float], None] | None = None,
+    language: str = "en",
+    translate: bool = False,
 ) -> tuple[str, str | None, float]:
     """Runs exactly one step (one file's one phase, or a job-level step
     when step["file"] is None) synchronously in a worker thread. Returns
@@ -319,12 +321,14 @@ def _run_single_step(
                 if progress_cb is not None and file_duration_sec > 0:
                     progress_cb(min(1.0, end_sec / file_duration_sec))
 
+            decode_options = build_decode_options(language, translate)
+
             if execution == "modal":
                 upload_id = file_state[file_info["path"]]["modal_upload_id"]
                 started = time.perf_counter()
                 try:
                     raw = modal_transcriber.transcribe(
-                        upload_id, BEAM_SIZE,
+                        upload_id, decode_options,
                         should_cancel=should_cancel, on_progress=on_segment_end,
                     )
                 except StepCancelled:
@@ -360,7 +364,7 @@ def _run_single_step(
                     modal_transcriber.upload(audio_bytes, retry_upload_id, should_cancel=should_cancel)
                     file_state[file_info["path"]]["modal_upload_id"] = retry_upload_id
                     raw = modal_transcriber.transcribe(
-                        retry_upload_id, BEAM_SIZE,
+                        retry_upload_id, decode_options,
                         should_cancel=should_cancel, on_progress=on_segment_end,
                     )
                 # Cost is billed on the *full* RPC wall time (incl. cold
@@ -370,14 +374,48 @@ def _run_single_step(
                 # (model, GPU) pair.
                 real_cost = ((time.perf_counter() - started) / 3600) * _gpu_rate(gpu)
                 segments = [engine.Segment(**s) for s in raw["segments"]]
+                det_language, det_prob = raw["detected_language"], raw["detected_probability"]
                 if file_duration_sec > 0:
                     calibration.record_rtf_sample(model_name, gpu, raw["inference_sec"] / file_duration_sec)
             else:
                 model = engine.get_model(model_name, device="cpu")  # already loaded by the Setup pass; cheap
                 started = time.perf_counter()
-                segments = engine.transcribe(model, audio_path, should_cancel=should_cancel, on_progress=on_segment_end)
+                segments, tinfo = engine.transcribe(
+                    model, audio_path, should_cancel=should_cancel, on_progress=on_segment_end,
+                    language=language, translate=translate,
+                )
+                det_language, det_prob = tinfo.detected_language, tinfo.detected_probability
                 if file_duration_sec > 0:
                     calibration.record_rtf_sample(model_name, "cpu", (time.perf_counter() - started) / file_duration_sec)
+
+            # The audio's real language is always auto-detected; the output
+            # language/script is the user's choice. Both are logged so a
+            # mismatch (e.g. English audio forced into Tamil script) is
+            # visible rather than silent.
+            det_name = WHISPER_LANGUAGES.get(det_language, det_language)
+            out_lang = "en" if translate else (det_language if language == AUTO_LANGUAGE else language)
+            out_name = WHISPER_LANGUAGES.get(out_lang, out_lang)
+            how = "translated to English" if translate else "written in " + out_name + " script"
+            msg = (
+                f"Language for {file_info['path']}: detected {det_name} ({det_language}, "
+                f"{det_prob:.0%}); output {how}"
+            )
+            job.emit({"event": "log", "text": msg})
+            logger.info(msg)
+            if det_prob < 0.6:
+                warn = (
+                    f"Low language-detection confidence ({det_prob:.0%}) for {file_info['path']} -- "
+                    "the audio may be noisy, silent at the start, or mixed-language."
+                )
+                job.emit({"event": "log", "text": warn})
+                logger.warning(warn)
+            if not translate and out_lang != det_language:
+                warn = (
+                    f"{file_info['path']}: audio sounds like {det_name}, but output is forced to {out_name} "
+                    f"script -- the text is written in {out_name} letters, not translated."
+                )
+                job.emit({"event": "log", "text": warn})
+                logger.warning(warn)
 
             for fmt in formats:
                 out_path = abs_path.with_suffix(f".{fmt}")
@@ -468,11 +506,13 @@ async def run_job(
     modal_token_id: str | None = None,
     modal_token_secret: str | None = None,
     hf_token: str | None = None,
+    language: str = "en",
+    translate: bool = False,
 ) -> None:
     logger = get_job_logger(job.id)
     logger.info(
-        "Job %s starting: %d file(s), model=%s, execution=%s, gpu=%s, cleanup=%s",
-        job.id, len(files), model, execution, gpu, cleanup,
+        "Job %s starting: %d file(s), model=%s, execution=%s, gpu=%s, cleanup=%s, language=%s, translate=%s",
+        job.id, len(files), model, execution, gpu, cleanup, language, translate,
     )
 
     steps = compute_steps(files, model, execution, gpu, cleanup)
@@ -654,7 +694,7 @@ async def run_job(
                 outcome, err, cost = await asyncio.to_thread(
                     _run_single_step, step, folder, model, formats, execution, gpu,
                     modal_transcriber, hf_token, job, logger, file_state,
-                    _make_progress_cb(step),
+                    _make_progress_cb(step), language, translate,
                 )
                 total_cost += cost
                 elapsed_estimated += step["sec"]

@@ -77,6 +77,19 @@
       </div>
 
       <div class="field-row">
+        <label><input type="checkbox" id="translate-check" /> Translate to English</label>
+        <p class="hint" id="translate-hint"></p>
+      </div>
+
+      <div class="field-row">
+        <label for="language-select">
+          Transcription script
+          <span class="hint" id="language-hint">(the script the text is written in -- the audio's language is always auto-detected; a non-matching script is transliterated, not translated)</span>
+        </label>
+        <select id="language-select"></select>
+      </div>
+
+      <div class="field-row">
         <label>Output formats</label>
         <div class="inline-checks" id="format-checks">
           <label><input type="checkbox" value="txt" checked /> txt</label>

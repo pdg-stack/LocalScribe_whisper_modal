@@ -467,6 +467,75 @@ const tokenSecretInput = document.getElementById("modal-token-secret");
 const hfTokenInput = document.getElementById("hf-token");
 const cleanupCheck = document.getElementById("cleanup-check");
 const previewBtn = document.getElementById("preview-btn");
+const languageSelect = document.getElementById("language-select");
+const translateCheck = document.getElementById("translate-check");
+const translateHint = document.getElementById("translate-hint");
+
+// Language list + the models that can't translate come from the backend
+// (config.py) so there's one source of truth. Until it loads, the select
+// holds just English (the default) so the form is never empty.
+let translateUnsupportedModels = ["large-v3-turbo"];
+languageSelect.innerHTML = '<option value="en">English</option>';
+
+async function loadLanguageOptions() {
+  try {
+    const res = await fetch("/api/language-options");
+    if (!res.ok) throw new Error();
+    const data = await res.json();
+    translateUnsupportedModels = data.translate_unsupported_models;
+    languageSelect.innerHTML = "";
+    const auto = document.createElement("option");
+    auto.value = data.auto;
+    auto.textContent = "Auto-detect (may mis-detect)";
+    languageSelect.appendChild(auto);
+    data.languages.forEach((l) => {
+      const opt = document.createElement("option");
+      opt.value = l.code;
+      opt.textContent = l.name;
+      languageSelect.appendChild(opt);
+    });
+    languageSelect.value = data.default;
+  } catch (e) {
+    // Most likely the server is still running old code (no
+    // /api/language-options) -- say so instead of silently showing one option.
+    document.getElementById("language-hint").textContent =
+      "(could not load the language list -- restart the LocalScribe server and reload this page)";
+  }
+}
+
+// Translate to English:
+// - unavailable for models fine-tuned without translation data
+//   (large-v3-turbo): disabled and unticked, with the reason shown;
+// - when ticked, the output is English regardless of the spoken language,
+//   so the language dropdown is set to English and disabled (the backend
+//   auto-detects the real source language for the translate task);
+// - when unticked, the dropdown is active again and gets back whatever
+//   language it had before.
+let languageBeforeTranslate = null;
+function updateTranslateState() {
+  const unsupported = translateUnsupportedModels.includes(modelSelect.value);
+  if (unsupported) translateCheck.checked = false;
+  translateCheck.disabled = unsupported;
+  translateHint.textContent = unsupported
+    ? `${modelSelect.value} can't translate -- choose another model (e.g. medium or large-v3) to enable this.`
+    : "Outputs English text from any spoken language; the language below is then fixed to English.";
+
+  if (translateCheck.checked) {
+    if (languageBeforeTranslate === null) languageBeforeTranslate = languageSelect.value;
+    languageSelect.value = "en";
+    languageSelect.disabled = true;
+  } else {
+    if (languageBeforeTranslate !== null) {
+      languageSelect.value = languageBeforeTranslate;
+      languageBeforeTranslate = null;
+    }
+    languageSelect.disabled = false;
+  }
+}
+translateCheck.addEventListener("change", updateTranslateState);
+modelSelect.addEventListener("change", updateTranslateState);
+updateTranslateState();
+const languageOptionsReady = loadLanguageOptions();
 
 GPU_OPTIONS.forEach((gpu) => {
   const opt = document.createElement("option");
@@ -538,6 +607,7 @@ function setPreRunSectionsLocked(locked) {
     // about the selection/options actually changed here.
     renderScanTable();
     updateAnalyzeButtonState();
+    updateTranslateState();  // unlocking re-enables every control, incl. an unsupported-model translate box
     previewBtn.disabled = !computePreviewButtonEnabled();
   }
 }
@@ -579,7 +649,7 @@ function updatePreviewEnabled() {
   invalidatePreview();
 }
 
-[formatChecks, tokenIdInput, tokenSecretInput, hfTokenInput, gpuSelect, modelSelect].forEach((el) => {
+[formatChecks, tokenIdInput, tokenSecretInput, hfTokenInput, gpuSelect, modelSelect, languageSelect, translateCheck].forEach((el) => {
   el.addEventListener("input", () => { updatePreviewEnabled(); savePreferences(); });
   el.addEventListener("change", () => { updatePreviewEnabled(); savePreferences(); });
 });
@@ -599,6 +669,8 @@ cleanupCheck.addEventListener("change", () => { updatePreviewEnabled(); savePref
 // request) the Modal + Hugging Face credentials below, all in plaintext,
 // gitignored, local-only) ----------
 
+let prefsLoaded = false;  // set at the end of loadPreferences(), see savePreferences()
+
 async function savePreferences() {
   const prefs = {
     model: modelSelect.value,
@@ -606,12 +678,20 @@ async function savePreferences() {
     execution: currentExecutionMode(),
     gpu: gpuSelect.value,
     cleanup: cleanupCheck.checked,
-    // Saved at the user's request so they don't have to re-enter them --
-    // stored in plaintext in user_prefs.json (gitignored, local-only).
-    modal_token_id: tokenIdInput.value.trim() || null,
-    modal_token_secret: tokenSecretInput.value.trim() || null,
-    hf_token: hfTokenInput.value.trim() || null,
+    transcription_script: languageSelect.value,
+    translate_to_english: translateCheck.checked,
   };
+  // Saved at the user's request so they don't have to re-enter them --
+  // stored in plaintext in user_prefs.json (gitignored, local-only).
+  // Only included once the saved values have been loaded into the fields:
+  // an empty box before that point means "not loaded yet", not "user
+  // cleared it", and sending null would make the backend erase the saved
+  // credential.
+  if (prefsLoaded) {
+    prefs.modal_token_id = tokenIdInput.value.trim() || null;
+    prefs.modal_token_secret = tokenSecretInput.value.trim() || null;
+    prefs.hf_token = hfTokenInput.value.trim() || null;
+  }
   try {
     await fetch("/api/preferences", {
       method: "POST",
@@ -641,10 +721,17 @@ async function loadPreferences() {
   }
   if (prefs.gpu) gpuSelect.value = prefs.gpu;
   if (typeof prefs.cleanup === "boolean") cleanupCheck.checked = prefs.cleanup;
+  // Language list loads async -- wait for it so a saved language (which
+  // may not be "en") exists as an <option> before it's selected.
+  await languageOptionsReady;
+  if (prefs.transcription_script && [...languageSelect.options].some((o) => o.value === prefs.transcription_script)) languageSelect.value = prefs.transcription_script;
+  if (typeof prefs.translate_to_english === "boolean") translateCheck.checked = prefs.translate_to_english;
+  updateTranslateState();
   if (prefs.modal_token_id) tokenIdInput.value = prefs.modal_token_id;
   if (prefs.modal_token_secret) tokenSecretInput.value = prefs.modal_token_secret;
   if (prefs.hf_token) hfTokenInput.value = prefs.hf_token;
   if (Array.isArray(prefs.folder_history)) folderHistory = prefs.folder_history;
+  prefsLoaded = true;
   updatePreviewEnabled();
 }
 
@@ -888,6 +975,8 @@ function buildTranscribeRequest() {
     execution: mode,
     gpu: mode === "modal" ? gpuSelect.value : null,
     cleanup: cleanupCheck.checked,
+    language: languageSelect.value,
+    translate: translateCheck.checked && !translateCheck.disabled,
     // Also saved to user_prefs.json (plaintext) by savePreferences() so
     // the user doesn't have to re-enter them each time.
     modal_token_id: mode === "modal" ? tokenIdInput.value.trim() : null,
