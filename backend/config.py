@@ -10,6 +10,126 @@ OUTPUT_FORMATS = ["txt", "srt", "vtt", "json", "tsv"]
 # accuracy. Not exposed in the UI -- see plan for rationale.
 BEAM_SIZE = 5
 
+# ---------------------------------------------------------------------------
+# Language / task
+# ---------------------------------------------------------------------------
+
+# The 100 language codes faster-whisper 1.2.1 accepts for `language=`
+# (faster_whisper.tokenizer._LANGUAGE_CODES). Whisper writes each language
+# in its own native script, so this list doubles as the "transcription
+# script" choice. "auto" is not a Whisper code -- it means "let Whisper
+# detect it" (language=None) and is the only value that can mis-detect.
+DEFAULT_LANGUAGE = "en"
+AUTO_LANGUAGE = "auto"
+WHISPER_LANGUAGES = {
+    "af": "Afrikaans", "am": "Amharic", "ar": "Arabic", "as": "Assamese", "az": "Azerbaijani",
+    "ba": "Bashkir", "be": "Belarusian", "bg": "Bulgarian", "bn": "Bengali", "bo": "Tibetan",
+    "br": "Breton", "bs": "Bosnian", "ca": "Catalan", "cs": "Czech", "cy": "Welsh",
+    "da": "Danish", "de": "German", "el": "Greek", "en": "English", "es": "Spanish",
+    "et": "Estonian", "eu": "Basque", "fa": "Persian", "fi": "Finnish", "fo": "Faroese",
+    "fr": "French", "gl": "Galician", "gu": "Gujarati", "ha": "Hausa", "haw": "Hawaiian",
+    "he": "Hebrew", "hi": "Hindi", "hr": "Croatian", "ht": "Haitian Creole", "hu": "Hungarian",
+    "hy": "Armenian", "id": "Indonesian", "is": "Icelandic", "it": "Italian", "ja": "Japanese",
+    "jw": "Javanese", "ka": "Georgian", "kk": "Kazakh", "km": "Khmer", "kn": "Kannada",
+    "ko": "Korean", "la": "Latin", "lb": "Luxembourgish", "ln": "Lingala", "lo": "Lao",
+    "lt": "Lithuanian", "lv": "Latvian", "mg": "Malagasy", "mi": "Maori", "mk": "Macedonian",
+    "ml": "Malayalam", "mn": "Mongolian", "mr": "Marathi", "ms": "Malay", "mt": "Maltese",
+    "my": "Myanmar (Burmese)", "ne": "Nepali", "nl": "Dutch", "nn": "Nynorsk", "no": "Norwegian",
+    "oc": "Occitan", "pa": "Punjabi", "pl": "Polish", "ps": "Pashto", "pt": "Portuguese",
+    "ro": "Romanian", "ru": "Russian", "sa": "Sanskrit", "sd": "Sindhi", "si": "Sinhala",
+    "sk": "Slovak", "sl": "Slovenian", "sn": "Shona", "so": "Somali", "sq": "Albanian",
+    "sr": "Serbian", "su": "Sundanese", "sv": "Swedish", "sw": "Swahili", "ta": "Tamil",
+    "te": "Telugu", "tg": "Tajik", "th": "Thai", "tk": "Turkmen", "tl": "Tagalog",
+    "tr": "Turkish", "tt": "Tatar", "uk": "Ukrainian", "ur": "Urdu", "uz": "Uzbek",
+    "vi": "Vietnamese", "yi": "Yiddish", "yo": "Yoruba", "yue": "Cantonese", "zh": "Chinese",
+}
+
+# Whisper's translate task only ever outputs English. large-v3-turbo was
+# fine-tuned on transcription data only, so with task="translate" it tends
+# to ignore the task and emit source-language text -- silently wrong, so
+# it's blocked rather than allowed.
+TRANSLATE_UNSUPPORTED_MODELS = {"large-v3-turbo"}
+
+
+def validate_language_options(model: str, language: str, translate: bool) -> None:
+    """Raises ValueError with a user-facing message for an invalid
+    language/translate combination. Used by the API layer as the backend
+    twin of the frontend's disabled checkbox."""
+    if language != AUTO_LANGUAGE and language not in WHISPER_LANGUAGES:
+        raise ValueError(f"Unsupported language code: {language!r}.")
+    if translate and model in TRANSLATE_UNSUPPORTED_MODELS:
+        raise ValueError(
+            f"The {model} model does not support translation to English -- choose another "
+            "model (e.g. medium or large-v3) or untick 'Translate to English'."
+        )
+
+
+def build_decode_options(language: str, translate: bool) -> dict:
+    """Keyword arguments for faster-whisper's model.transcribe(), shared by
+    the local and Modal paths so both decode identically. Plain
+    JSON-friendly values only -- this dict is shipped to the Modal
+    container as an RPC argument.
+
+    The "silent" accuracy settings (not exposed in the UI):
+    - vad_filter: drops silence/music/noise before decoding. Cuts
+      hallucinated text over quiet stretches and keeps language detection
+      from being skewed by a silent/music intro.
+    - condition_on_previous_text=False: stops one bad segment (wrong
+      language, repetition loop) from being fed forward as context and
+      poisoning every segment after it. Slightly less cross-segment
+      consistency, far fewer runaway failures on long recordings.
+    - temperature fallback + compression_ratio/log_prob/no_speech
+      thresholds: Whisper re-decodes a segment at higher temperature when
+      it looks repetitive or low-confidence (these are faster-whisper's
+      defaults, pinned here so an upstream default change can't silently
+      alter accuracy).
+    - hallucination_silence_threshold: with word timestamps on, skips
+      segments that are hallucinated over >2s of silence.
+    - language_detection_segments/threshold: for Auto only, detect from up
+      to 4 windows (not just the first 30s) and only trust a result with
+      >=0.5 probability.
+    - A pinned language skips detection entirely -- the only fully
+      reliable setting.
+    """
+    # Translate: the UI fixes the language box to "English" (the *output*
+    # language), but passing language="en" would tell Whisper the audio is
+    # already English and it would skip translating. So for translate the
+    # source language is always auto-detected.
+    is_auto = language == AUTO_LANGUAGE or translate
+    return {
+        "language": None if is_auto else language,
+        "task": "translate" if translate else "transcribe",
+        "beam_size": BEAM_SIZE,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 500},
+        "condition_on_previous_text": False,
+        "temperature": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.0,
+        "no_speech_threshold": 0.6,
+        "word_timestamps": True,
+        "hallucination_silence_threshold": 2.0,
+        "language_detection_segments": 4,
+        "language_detection_threshold": 0.5,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Model weight storage
+# ---------------------------------------------------------------------------
+
+# Local execution stores downloaded Whisper weights here (override with the
+# LOCALSCRIBE_MODEL_DIR env var), passed to faster-whisper as download_root
+# -- a fixed, project-local folder (gitignored) that outlives the process,
+# so a model is downloaded once and reused by every later job and restart.
+# Modal execution has its own, separate Volume (modal_app.MODEL_CACHE_VOLUME).
+import os as _os
+from pathlib import Path as _Path
+
+LOCAL_MODEL_DIR = _Path(
+    _os.environ.get("LOCALSCRIBE_MODEL_DIR") or _Path(__file__).resolve().parent.parent / "models"
+)
+
 GPU_OPTIONS = [
     {"id": "T4", "label": "T4", "rate": 0.59},
     {"id": "L4", "label": "L4", "rate": 0.80},

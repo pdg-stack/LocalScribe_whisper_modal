@@ -65,6 +65,27 @@ only), streaming/live audio.
 ### 4.3 Options
 - Whisper model: `tiny`, `base`, `small`, `medium`, `large-v3`,
   `large-v3-turbo`.
+- Both of these sit directly under the Hugging Face token field, in this
+  order:
+  1. **Translate to English** checkbox (default off). Whisper's translate
+     task only ever outputs English (any language → English; no other
+     targets). Disabled and unticked for models that can't translate
+     (`large-v3-turbo`, fine-tuned without translation data — it ignores
+     the task and emits source-language text); the backend rejects that
+     combination with a 400 as well. When ticked, the language dropdown
+     below is set to **English and disabled**; unticking re-enables it and
+     restores its previous value. Because forcing `language=en` would make
+     Whisper skip translating, the backend auto-detects the *source*
+     language whenever translate is on. (In all cases the audio's real
+     language is auto-detected and logged — see 4.5.)
+  2. **Transcription script** (language) dropdown: **English (default)**,
+     **Auto-detect**, and all 100 languages faster-whisper supports (list
+     served by `GET /api/language-options`, defined in
+     `backend/config.py`; if it can't load, the page says to restart the
+     server). Whisper writes each language in its own native script, so
+     this is also the script choice. A pinned language skips detection;
+     Auto can mis-detect (e.g. English speech with a silent/noisy intro
+     coming out as Tamil/Telugu), which is why English is the default.
 - Output formats (multi-select): `txt`, `srt`, `vtt`, `json`, `tsv`.
 - Execution: **Local** (CPU) or **Modal.com** (GPU).
   - Modal.com reveals a GPU type dropdown (T4/L4/A10G/A100/H100, each
@@ -72,7 +93,8 @@ only), streaming/live audio.
     two credential fields — **Modal Token ID** and **Modal Token Secret**
     (password inputs).
 - "Delete intermediate audio files when done" checkbox.
-- Model/formats/execution/GPU/credential selections persist across
+- Model/language/translate/formats/execution/GPU/credential selections
+  persist across
   sessions in `user_prefs.json`, at the user's explicit request (revised
   from the original "credentials never persist" design) — the Token
   ID/Secret are stored there in **plaintext**; the file stays gitignored
@@ -100,7 +122,14 @@ only), streaming/live audio.
 1. Extract audio via ffmpeg to a 16kHz mono WAV (same basename/folder as
    source), skipped for files that are already audio.
 2. Transcribe (local faster-whisper, or an ephemeral Modal.com GPU
-   function) → segments.
+   function) → segments, using the selected language/task and the
+   accuracy settings in 4.8. The audio's real spoken language is **always
+   auto-detected** (VAD-filtered, up to 4 windows) and logged per file with
+   its confidence, alongside what the output was (translated to English /
+   written in a given script). Warnings are logged when detection
+   confidence is below 60%, and when a forced non-English script differs
+   from the detected language (the text is then written in that script,
+   i.e. transliterated, not translated).
 3. Write one output file per selected format (same basename/folder).
 4. If cleanup is checked, delete the WAV generated in step 1 only (never a
    pre-existing original audio file).
@@ -116,7 +145,28 @@ file.
   values, not estimates). No per-file breakdown in the UI — full detail
   lives in the log files.
 
-### 4.7 Logging
+### 4.7 Model storage
+- **Local**: weights are downloaded once into a fixed project folder,
+  `models/` (gitignored; override with the `LOCALSCRIBE_MODEL_DIR` env
+  var), passed to faster-whisper as `download_root`. Every later job and
+  server restart reuses them. (This app does not run in Docker; if you
+  containerize it, mount a persistent volume at that path.)
+- **Modal.com**: a separate Modal Volume, `localscribe-whisper-model-cache`,
+  mounted in the container at `/cache` and committed after model load so
+  a first download persists. It is independent of the local folder and
+  of the short-lived `localscribe-audio-uploads` Volume.
+
+### 4.8 Accuracy settings (not exposed in the UI)
+Shared by local and Modal via `build_decode_options()` in
+`backend/config.py`: Silero VAD filter (drops silence/music before
+decoding), `condition_on_previous_text=False` (stops one bad segment or
+wrong-language run from poisoning later ones), temperature fallback with
+compression-ratio / log-prob / no-speech thresholds pinned to Whisper's
+reference values, word timestamps + `hallucination_silence_threshold=2s`,
+beam size 5, and — for Auto only — language detection over up to 4
+windows with a 0.5 probability threshold.
+
+### 4.9 Logging
 - JSON-line process logs written locally under `logs/` (gitignored,
   private — never committed).
 
@@ -131,8 +181,8 @@ file.
 
 ## 6. Non-goals
 - Multi-user access control, cloud deployment of the app itself,
-  translation, live/streaming transcription, engines other than
-  faster-whisper.
+  translation to any language other than English (Whisper limitation),
+  live/streaming transcription, engines other than faster-whisper.
 
 ## 7. Open questions / risks
 - `ctranslate2`/`faster-whisper` wheel availability on very recent Python

@@ -108,6 +108,14 @@ def _build_transcriber_cls(model_name: str):
             # Runs once per container, when it starts -- not per file.
             from faster_whisper import WhisperModel
             self.model = WhisperModel(model_name, device="cuda", compute_type="float16", download_root=MODEL_CACHE_DIR)
+            # A fresh download is only durable once the Volume is
+            # committed -- without this, weights written during the very
+            # first load can be lost with the container and re-downloaded
+            # next job. A cheap no-op when nothing new was written.
+            try:
+                MODEL_CACHE_VOLUME.commit()
+            except Exception:
+                pass  # best-effort: never fail Setup over cache persistence
 
         @modal.method()
         def ping(self) -> bool:
@@ -142,7 +150,7 @@ def _build_transcriber_cls(model_name: str):
             AUDIO_UPLOAD_VOLUME.commit()
 
         @modal.method()
-        def transcribe(self, upload_id: str, beam_size: int, progress_queue: modal.Queue | None = None) -> dict:
+        def transcribe(self, upload_id: str, options: dict, progress_queue: modal.Queue | None = None) -> dict:
             import os
             import time
 
@@ -161,7 +169,17 @@ def _build_transcriber_cls(model_name: str):
             # time (excluding model load, which isn't proportional to
             # audio length, and already happened once in load_model()).
             started = time.perf_counter()
-            segments_iter, _info = self.model.transcribe(path, beam_size=beam_size)
+            # options is backend.config.build_decode_options() -- built
+            # locally and shipped here because this container can't
+            # import our package.
+            from faster_whisper.audio import decode_audio
+            audio = decode_audio(path, sampling_rate=16000)
+            # True spoken language, always auto-detected, independent of
+            # the output language/script in `options`.
+            det_lang, det_prob, _ = self.model.detect_language(
+                audio, vad_filter=True, language_detection_segments=4, language_detection_threshold=0.5,
+            )
+            segments_iter, info = self.model.transcribe(audio, **options)
             segments = []
             for s in segments_iter:
                 segments.append({"start": s.start, "end": s.end, "text": s.text.strip()})
@@ -184,7 +202,14 @@ def _build_transcriber_cls(model_name: str):
             # same as every other phase, instead of hiding real work
             # (and a real network round-trip for the commit) inside what
             # the UI shows as "Transcription."
-            return {"segments": segments, "inference_sec": inference_sec}
+            return {
+                "segments": segments,
+                "inference_sec": inference_sec,
+                "language": info.language,
+                "language_probability": info.language_probability,
+                "detected_language": det_lang,
+                "detected_probability": det_prob,
+            }
 
         @modal.method()
         def delete_upload(self, upload_id: str) -> None:
@@ -217,7 +242,7 @@ class ModalTranscriber:
         with ModalTranscriber(gpu, model, token_id, token_secret, hf_token) as t:
             for file in files:
                 t.upload(audio_bytes, upload_id, should_cancel=...)
-                t.transcribe(upload_id, beam_size, should_cancel=...)
+                t.transcribe(upload_id, options, should_cancel=...)
 
     Every file's calls within that `with` block reuse the same container
     and the same already-loaded model -- Modal only cold-starts once for
@@ -386,11 +411,14 @@ class ModalTranscriber:
     def transcribe(
         self,
         upload_id: str,
-        beam_size: int,
+        options: dict,
         should_cancel: Callable[[], bool] | None = None,
         on_progress: Callable[[float], None] | None = None,
     ) -> dict:
-        """Returns {"segments": [...], "inference_sec": float}. Transcribes
+        """Returns {"segments": [...], "inference_sec": float, "language":
+        str, "language_probability": float}. `options` are the
+        faster-whisper decode kwargs from config.build_decode_options().
+        Transcribes
         whatever upload(audio_bytes, upload_id, ...) already placed on the
         container for this upload_id -- this call itself only ever sends
         a small id string, not the audio, so it starts immediately rather
@@ -412,7 +440,7 @@ class ModalTranscriber:
         running -- otherwise this RPC returns nothing at all until the
         entire file (which can be very long) is fully transcribed."""
         with modal.Queue.ephemeral() as progress_queue:
-            call = self._instance.transcribe.spawn(upload_id, beam_size, progress_queue)
+            call = self._instance.transcribe.spawn(upload_id, options, progress_queue)
             while True:
                 if on_progress is not None:
                     for processed_sec in progress_queue.get_many(1000, block=False):

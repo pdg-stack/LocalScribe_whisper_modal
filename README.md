@@ -19,6 +19,11 @@ either on your own machine (CPU) or on [Modal.com](https://modal.com) GPUs.
 - Preview estimated time/cost per phase before committing — estimates
   self-calibrate against your own machine's/GPU's real measured
   performance over time, not just a static guess.
+- Choose the spoken language (default **English**; or Auto-detect, or any
+  of Whisper's 100 languages) and optionally **Translate to English**
+  (not available for `large-v3-turbo`). Pinning the language avoids
+  Whisper's occasional mis-detection; the language actually used is
+  logged for every file.
 - Run with a live progress bar, a per-phase status icon next to each row
   (spinner → green check, red cross, or yellow for a partial mix of
   success/failure), and a status log.
@@ -107,8 +112,10 @@ credentials you enter in the UI. (If you separately use the `modal` CLI
 for other things, note that a manually-configured local profile is
 overridden by whatever credentials the app sends for its own requests.)
 
-Model weights are cached in a Modal Volume across runs, so only the
-first Modal run for a given model size re-downloads it. Optionally, add
+Model weights are cached across runs, so each model size is downloaded
+once: locally into the project's `models/` folder (set
+`LOCALSCRIBE_MODEL_DIR` to move it), and for Modal.com into its own
+separate Modal Volume (`localscribe-whisper-model-cache`). Optionally, add
 a [Hugging Face token](https://huggingface.co/settings/tokens) in the
 Options panel (applies to both Local and Modal execution) to raise the
 download rate limit for that first download — unauthenticated requests

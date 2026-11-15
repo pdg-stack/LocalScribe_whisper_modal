@@ -15,6 +15,9 @@ class PreferencesModel(BaseModel):
     execution: str | None = None
     gpu: str | None = None
     cleanup: bool | None = None
+    # Saved under the same names as their labels in the Options step.
+    transcription_script: str | None = None
+    translate_to_english: bool | None = None
     # Persisted at the user's explicit request so they don't have to
     # re-enter them each time -- stored in plaintext in user_prefs.json
     # (gitignored, local-only, never transmitted anywhere but Modal).
@@ -49,6 +52,10 @@ class TranscribeRequest(BaseModel):
     modal_token_id: str | None = None
     modal_token_secret: str | None = None
     hf_token: str | None = None
+    # Whisper language code ("en", "ta", ...) or "auto" for detection.
+    language: str = "en"
+    # Translate speech to English (Whisper's only translation target).
+    translate: bool = False
 
 
 class PreviewRequest(TranscribeRequest):
